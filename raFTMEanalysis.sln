@@ -9,6 +9,11 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RockwellRsvCRCCreateSignitu
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RockwellRsvCRCValidateSigniture", "RockwellRsvCRCValidateSigniture\RockwellRsvCRCValidateSigniture.vcxproj", "{6209AFE0-F3FF-4839-AA9A-90C9FE9126C9}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{3DED91E4-9FED-40C4-9C76-07911A754A19}"
+	ProjectSection(SolutionItems) = preProject
+		gitignore.txt = gitignore.txt
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
