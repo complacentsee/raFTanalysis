@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-cpp:
+    name: Build C++ (RSLinxBrowse + RSLinxHook)
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build RSLinxBrowse (Release|Win32)
+        run: msbuild RSLinxBrowse\RSLinxBrowse.vcxproj /p:Configuration=Release /p:Platform=Win32 /verbosity:minimal
+
+      - name: Build RSLinxHook (Release|Win32)
+        run: msbuild RSLinxHook\RSLinxHook.vcxproj /p:Configuration=Release /p:Platform=Win32 /verbosity:minimal
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-binaries
+          path: |
+            Release/RSLinxBrowse.exe
+            Release/RSLinxHook.dll
+
+  build-viewer:
+    name: Build RSLinxViewer (.NET 8)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build RSLinxViewer
+        run: dotnet build RSLinxViewer\RSLinxViewer.csproj -c Release
+
+      - name: Publish self-contained x86
+        run: dotnet publish RSLinxViewer\RSLinxViewer.csproj -r win-x86 --self-contained -c Release -o publish
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rslinxviewer
+          path: publish/
