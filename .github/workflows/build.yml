@@ -17,10 +17,10 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build RSLinxBrowse (Release|Win32)
-        run: msbuild RSLinxBrowse\RSLinxBrowse.vcxproj /p:Configuration=Release /p:Platform=Win32 /verbosity:minimal
+        run: msbuild RSLinxBrowse\RSLinxBrowse.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /verbosity:minimal
 
       - name: Build RSLinxHook (Release|Win32)
-        run: msbuild RSLinxHook\RSLinxHook.vcxproj /p:Configuration=Release /p:Platform=Win32 /verbosity:minimal
+        run: msbuild RSLinxHook\RSLinxHook.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /verbosity:minimal
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
