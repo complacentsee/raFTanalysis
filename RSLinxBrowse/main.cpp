@@ -76,7 +76,7 @@ static void PipeSendLine(const std::string& line)
 
 static void PipeSendConfig(const std::vector<DriverSpec>& drivers,
     const std::vector<bool>& needsHotLoad,
-    const std::wstring& logDir, bool debugXml, bool monitorMode)
+    const std::wstring& logDir, bool debugXml, bool monitorMode, bool probeDispids = false)
 {
     PipeSendLine(monitorMode ? "C|MODE=monitor" : "C|MODE=inject");
     if (logDir != L"C:\\temp") {
@@ -85,6 +85,7 @@ static void PipeSendConfig(const std::vector<DriverSpec>& drivers,
         PipeSendLine(std::string("C|LOGDIR=") + utf8);
     }
     if (debugXml) PipeSendLine("C|DEBUGXML=1");
+    if (probeDispids) PipeSendLine("C|PROBE=1");
 
     for (size_t di = 0; di < drivers.size(); di++) {
         char utf8[256];
@@ -635,7 +636,7 @@ static int CreateDriverRegistry(const std::wstring& driverName, const std::vecto
     return 2;
 }
 
-static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstring& logDir, bool debugXml)
+static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstring& logDir, bool debugXml, bool probeDispids)
 {
     PrintHeader(L"RSLinx Hook Injection Mode");
 
@@ -736,7 +737,7 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
     std::wcout << L"[OK] Hook connected via pipe" << std::endl;
 
     // Step 7: Send config over pipe
-    PipeSendConfig(drivers, driverNeedsHotLoad, logDir, debugXml, false);
+    PipeSendConfig(drivers, driverNeedsHotLoad, logDir, debugXml, false, probeDispids);
     std::wcout << L"[OK] Config sent via pipe" << std::endl;
 
     // Step 8: Read pipe messages (log lines streamed to console in real-time)
@@ -921,7 +922,7 @@ static int RunExternalMode(const std::wstring& driverName, const std::wstring& t
 // Monitor Mode — browse existing driver topology (no creation)
 // ============================================================
 
-static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wstring& logDir, bool debugXml)
+static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wstring& logDir, bool debugXml, bool probeDispids)
 {
     PrintHeader(L"RSLinx Monitor Mode (browse existing)");
 
@@ -1010,7 +1011,7 @@ static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wst
 
     // Step 7: Send config over pipe (MODE=inject preserved — monitor flag only skips driver creation)
     std::vector<bool> noHotLoad(drivers.size(), false);
-    PipeSendConfig(drivers, noHotLoad, logDir, debugXml, false);
+    PipeSendConfig(drivers, noHotLoad, logDir, debugXml, false, probeDispids);
     std::wcout << L"[OK] Config sent via pipe" << std::endl;
 
     // Step 8: Read pipe messages (log lines streamed to console in real-time)
@@ -1085,6 +1086,7 @@ int wmain(int argc, wchar_t* argv[])
     bool monitorMode = false;
     std::wstring logDir = L"C:\\temp";
     bool debugXml = false;
+    bool probeDispids = false;
 
     // Parse arguments — --driver pushes a new entry, --ip appends to the last driver
     int posArg = 0;
@@ -1101,6 +1103,10 @@ int wmain(int argc, wchar_t* argv[])
         else if (_wcsicmp(argv[i], L"--debug-xml") == 0 || _wcsicmp(argv[i], L"-debug-xml") == 0)
         {
             debugXml = true;
+        }
+        else if (_wcsicmp(argv[i], L"--probe") == 0 || _wcsicmp(argv[i], L"-probe") == 0)
+        {
+            probeDispids = true;
         }
         else if ((_wcsicmp(argv[i], L"--ip") == 0 || _wcsicmp(argv[i], L"-ip") == 0) && i + 1 < argc)
         {
@@ -1155,9 +1161,11 @@ int wmain(int argc, wchar_t* argv[])
         std::wcout << L"Log directory: " << logDir << std::endl;
     if (debugXml)
         std::wcout << L"Debug XML: enabled" << std::endl;
+    if (probeDispids)
+        std::wcout << L"DISPID probing: enabled" << std::endl;
 
     if (monitorMode)
-        return RunMonitorMode(drivers, logDir, debugXml);
+        return RunMonitorMode(drivers, logDir, debugXml, probeDispids);
     else
-        return RunInjectMode(drivers, logDir, debugXml);
+        return RunInjectMode(drivers, logDir, debugXml, probeDispids);
 }

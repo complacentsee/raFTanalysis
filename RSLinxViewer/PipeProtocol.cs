@@ -69,7 +69,7 @@ sealed class PipeServer : IDisposable
     }
 
     /// <summary>Send config to hook DLL over pipe. Call after connection established.</summary>
-    public void SendConfig(List<DriverArg> drivers, string logDir, bool debugXml, bool monitorMode)
+    public void SendConfig(List<DriverArg> drivers, string logDir, bool debugXml, bool monitorMode, bool probeDispids = false)
     {
         var sb = new StringBuilder();
         sb.AppendLine(monitorMode ? "C|MODE=monitor" : "C|MODE=inject");
@@ -77,6 +77,8 @@ sealed class PipeServer : IDisposable
             sb.AppendLine($"C|LOGDIR={logDir}");
         if (debugXml)
             sb.AppendLine("C|DEBUGXML=1");
+        if (probeDispids)
+            sb.AppendLine("C|PROBE=1");
         foreach (var drv in drivers)
         {
             sb.AppendLine($"C|DRIVER={drv.Name}");

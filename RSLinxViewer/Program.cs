@@ -14,6 +14,7 @@ class Program
         string logDir = @"C:\temp";
         bool debugXml = false;
         bool monitorMode = false;
+        bool probeDispids = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -46,11 +47,15 @@ class Program
             {
                 monitorMode = true;
             }
+            else if (arg == "--probe")
+            {
+                probeDispids = true;
+            }
         }
 
         if (drivers.Count == 0)
         {
-            AnsiConsole.MarkupLine("[red]Usage:[/] RSLinxViewer --driver NAME [[IP...]] [[--driver NAME2 [[IP...]]]] [[--dll PATH]] [[--debug-xml]] [[--monitor]]");
+            AnsiConsole.MarkupLine("[red]Usage:[/] RSLinxViewer --driver NAME [[IP...]] [[--driver NAME2 [[IP...]]]] [[--dll PATH]] [[--debug-xml]] [[--monitor]] [[--probe]]");
             return 1;
         }
 
@@ -142,7 +147,7 @@ class Program
         // Send config over pipe (replaces hook_config.txt)
         try
         {
-            pipeServer.SendConfig(drivers, logDir, debugXml, monitorMode);
+            pipeServer.SendConfig(drivers, logDir, debugXml, monitorMode, probeDispids);
         }
         catch (IOException ex)
         {

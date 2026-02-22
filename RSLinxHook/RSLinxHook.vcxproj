@@ -84,7 +84,31 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="RSLinxHook.cpp" />
+    <ClInclude Include="RSLinxHook_fwd.h" />
+    <ClInclude Include="Logging.h" />
+    <ClInclude Include="ComInterfaces.h" />
+    <ClInclude Include="Config.h" />
+    <ClInclude Include="SEHHelpers.h" />
+    <ClInclude Include="EventSink.h" />
+    <ClInclude Include="DispatchHelpers.h" />
+    <ClInclude Include="TopologyXML.h" />
+    <ClInclude Include="EngineHotLoad.h" />
+    <ClInclude Include="STAHook.h" />
+    <ClInclude Include="BrowseOperations.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Logging.cpp" />
+    <ClCompile Include="ComInterfaces.cpp" />
+    <ClCompile Include="Config.cpp" />
+    <ClCompile Include="SEHHelpers.cpp" />
+    <ClCompile Include="EventSink.cpp" />
+    <ClCompile Include="DispatchHelpers.cpp" />
+    <ClCompile Include="TopologyXML.cpp" />
+    <ClCompile Include="EngineHotLoad.cpp" />
+    <ClCompile Include="STAHook.cpp" />
+    <ClCompile Include="BrowseOperations.cpp" />
+    <ClCompile Include="dead_code.cpp" />
+    <ClCompile Include="DllMain.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
