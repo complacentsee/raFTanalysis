@@ -168,7 +168,10 @@ STDMETHODIMP DualEventSink::Found(IUnknown* pBus, VARIANT addr)
         }
     }
     else
+    {
         m_seenAddresses.insert(addrBuf);
+        m_addressesInOrder.push_back(addrBuf);  // Preserve discovery order for address-device correlation
+    }
     LeaveCriticalSection(&m_cs);
 
     g_discoveredDevices.push_back(addrBuf);
@@ -232,7 +235,10 @@ STDMETHODIMP DualEventSink::OnBrowseAddressFound(IUnknown*, VARIANT addr)
         }
     }
     else
+    {
         m_seenAddresses.insert(addrBuf);
+        m_addressesInOrder.push_back(addrBuf);  // Preserve discovery order for address-device correlation
+    }
     LeaveCriticalSection(&m_cs);
 
     g_discoveredDevices.push_back(addrBuf);

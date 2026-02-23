@@ -25,3 +25,7 @@ HRESULT DoBusBrowse();
 HRESULT DoBackplaneBrowse();
 HRESULT DoCleanupOnMainSTA();
 void RunMonitorLoop(const HookConfig& config, IRSTopologyGlobals* pGlobals, const std::vector<BusInfo>& buses);
+
+// Direct COM topology tree walk (no XML dependency)
+struct TopoNode;  // Forward declaration (defined in TopologyXML.h)
+TopoNode DoTopologyTreeWalk();

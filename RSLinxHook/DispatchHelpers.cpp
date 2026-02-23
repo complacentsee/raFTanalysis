@@ -165,6 +165,41 @@ std::vector<IDispatch*> EnumerateCollection(IDispatch* pCollection)
 }
 
 // ============================================================
+// ITopologyObject property extraction
+// ============================================================
+
+TopoObjectProps GetTopoObjectProps(IDispatch* pDefaultDisp)
+{
+    TopoObjectProps props;
+    if (!pDefaultDisp) return props;
+
+    // Get IADs properties (default IDispatch): DISPID 1=Name, 2=ObjectID
+    props.name = DispatchGetString(pDefaultDisp, 1);
+    props.objectId = DispatchGetString(pDefaultDisp, 2);
+
+    // QI for ITopologyObject dispatch (dual interface, different DISPID space)
+    IUnknown* pUnk = nullptr;
+    pDefaultDisp->QueryInterface(IID_IUnknown, (void**)&pUnk);
+    if (!pUnk) return props;
+
+    IDispatch* pTopoDisp = nullptr;
+    pUnk->QueryInterface(IID_ITopologyObject, (void**)&pTopoDisp);
+    pUnk->Release();
+
+    if (pTopoDisp)
+    {
+        // ITopologyObject DISPIDs: 2=Name, 3=Class, 4=ObjectID, 5=Path, 6=Parent, 7=SchemaPath
+        props.classname = DispatchGetString(pTopoDisp, 3);
+        props.path = DispatchGetString(pTopoDisp, 5);
+        props.parent = DispatchGetString(pTopoDisp, 6);
+        props.schemaPath = DispatchGetString(pTopoDisp, 7);
+        pTopoDisp->Release();
+    }
+
+    return props;
+}
+
+// ============================================================
 // DISPID Discovery — probe objects for available properties
 // ============================================================
 
@@ -251,7 +286,10 @@ void ProbeDeviceDISPIDs(IDispatch* pDisp, const wchar_t* label)
     // Probe via the IDispatch we already have
     ProbeDispatch(pDisp, L"IDispatch", label, devicePropNames, numDeviceProps, 0, 100);
 
-    // Probe via alternate interfaces (may expose different DISPIDs)
+    // Probe via alternate dispatch interfaces (may expose different DISPIDs).
+    // Only probe interfaces that are IDispatch-based (dual interfaces).
+    // IRSTopologyObject/IRSTopologyDevice are vtable-only (IUnknown-based) —
+    // casting them to IDispatch* and calling Invoke hits wrong vtable slots and crashes.
     IUnknown* pUnk = nullptr;
     pDisp->QueryInterface(IID_IUnknown, (void**)&pUnk);
     if (!pUnk) return;
@@ -260,14 +298,19 @@ void ProbeDeviceDISPIDs(IDispatch* pDisp, const wchar_t* label)
         { IID_ITopologyObject,       L"ITopologyObject" },
         { IID_ITopologyDevice_Dual,  L"ITopologyDevice_Dual" },
         { IID_ITopologyBus,          L"ITopologyBus" },
-        { IID_IRSTopologyObject,     L"IRSTopologyObject" },
-        { IID_IRSTopologyDevice,     L"IRSTopologyDevice" },
     };
 
     for (auto& iface : interfaces)
     {
+        // QI for the target interface, then verify it supports IDispatch
+        IUnknown* pIfaceUnk = nullptr;
+        HRESULT hr = pUnk->QueryInterface(iface.iid, (void**)&pIfaceUnk);
+        if (FAILED(hr) || !pIfaceUnk) continue;
+
         IDispatch* pAlt = nullptr;
-        HRESULT hr = pUnk->QueryInterface(iface.iid, (void**)&pAlt);
+        hr = pIfaceUnk->QueryInterface(IID_IDispatch, (void**)&pAlt);
+        pIfaceUnk->Release();
+
         if (SUCCEEDED(hr) && pAlt && pAlt != pDisp)
         {
             ProbeDispatch(pAlt, iface.name, label, devicePropNames, numDeviceProps, 0, 100);
@@ -276,6 +319,10 @@ void ProbeDeviceDISPIDs(IDispatch* pDisp, const wchar_t* label)
         else if (pAlt == pDisp)
         {
             Log(L"[PROBE:%s] %s == same IDispatch, skipping", label, iface.name);
+            pAlt->Release();
+        }
+        else if (pAlt)
+        {
             pAlt->Release();
         }
     }

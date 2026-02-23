@@ -160,7 +160,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
             }
             Log(L"[OK] Re-acquired workstation after hot-load(s)");
 
-            if (pGlobals)
+            if (pGlobals && config.debugXml)
             {
                 std::wstring verifyPath = LogPath(config.logDir, L"hook_topo_after_hotload.xml");
                 SaveTopologyXML(pGlobals, verifyPath.c_str());
@@ -490,13 +490,17 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
     // Save and send initial topology snapshot
     Log(L"");
     {
-        std::wstring beforePath = LogPath(config.logDir, config.debugXml ? L"hook_topo_before.xml" : L"hook_topo_poll.xml");
-        SaveTopologyXML(pGlobals, beforePath.c_str());
-        TopologyCounts before = CountDevicesInXML(beforePath.c_str());
-        PipeSendTopology(beforePath.c_str());
+        TopoNode beforeTree = DoTopologyTreeWalk();
+        TopologyCounts before = CountDevicesInTree(beforeTree);
+        PipeSendTree(beforeTree);
         PipeSendStatus(before.totalDevices, before.identifiedDevices, (int)g_discoveredDevices.size());
         Log(L"Topology BEFORE browse: %d devices, %d identified",
             before.totalDevices, before.identifiedDevices);
+        if (config.debugXml)
+        {
+            std::wstring beforePath = LogPath(config.logDir, L"hook_topo_before.xml");
+            SaveTopologyXML(pGlobals, beforePath.c_str());
+        }
     }
 
     // =============================================================
@@ -557,34 +561,31 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
             // Poll every 2s
             if (elapsed > 0 && elapsed % 2000 < 100)
             {
-                std::wstring pollFile;
-                if (config.debugXml) {
+                TopoNode pollTree = DoTopologyTreeWalk();
+                TopologyCounts c = CountDevicesInTree(pollTree);
+                PipeSendTree(pollTree);
+                PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
+                int cycled, total;
+                GetEnumeratorStatusSince(enumBaseline, cycled, total);
+                Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
+                    elapsed / 1000, c.totalDevices, c.identifiedDevices,
+                    (int)g_discoveredDevices.size(), cycled, total);
+
+                if (config.debugXml)
+                {
                     wchar_t fname[64];
                     swprintf(fname, 64, L"hook_topo_%ds.xml", elapsed / 1000);
-                    pollFile = LogPath(config.logDir, fname);
-                } else {
-                    pollFile = LogPath(config.logDir, L"hook_topo_poll.xml");
+                    SaveTopologyXML(pGlobals, LogPath(config.logDir, fname).c_str());
                 }
-                if (SaveTopologyXML(pGlobals, pollFile.c_str()))
-                {
-                    TopologyCounts c = CountDevicesInXML(pollFile.c_str());
-                    PipeSendTopology(pollFile.c_str());
-                    PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
-                    int cycled, total;
-                    GetEnumeratorStatusSince(enumBaseline, cycled, total);
-                    Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
-                        elapsed / 1000, c.totalDevices, c.identifiedDevices,
-                        (int)g_discoveredDevices.size(), cycled, total);
 
-                    // Check if all target IPs are identified (early exit after min 3s)
-                    std::vector<std::wstring> allIPs = config.allIPs();
-                    if (elapsed >= 3000 && !targetIdentified && !allIPs.empty() &&
-                        IsTargetIdentifiedInXML(pollFile.c_str(), allIPs))
-                    {
-                        targetIdentified = true;
-                        Log(L"  >> Target IPs identified at %ds — exiting Phase 3 early", elapsed / 1000);
-                        break;
-                    }
+                // Check if all target IPs are identified (early exit after min 3s)
+                std::vector<std::wstring> allIPs = config.allIPs();
+                if (elapsed >= 3000 && !targetIdentified && !allIPs.empty() &&
+                    IsTargetIdentifiedInTree(pollTree, allIPs))
+                {
+                    targetIdentified = true;
+                    Log(L"  >> Target IPs identified at %ds — exiting Phase 3 early", elapsed / 1000);
+                    break;
                 }
             }
 
@@ -606,11 +607,15 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
     // to discover modules (slots on the backplane bus).
     // =============================================================
     {
-        std::wstring midPath = LogPath(config.logDir, config.debugXml ? L"hook_topo_mid.xml" : L"hook_topo_poll.xml");
-        SaveTopologyXML(pGlobals, midPath.c_str());
-        TopologyCounts pre = CountDevicesInXML(midPath.c_str());
+        TopoNode midTree = DoTopologyTreeWalk();
+        TopologyCounts pre = CountDevicesInTree(midTree);
         Log(L"Topology after bus browse: %d devices, %d identified",
             pre.totalDevices, pre.identifiedDevices);
+        if (config.debugXml)
+        {
+            std::wstring midPath = LogPath(config.logDir, L"hook_topo_mid.xml");
+            SaveTopologyXML(pGlobals, midPath.c_str());
+        }
         // Only try bus browse if we have identified devices
         if (pre.identifiedDevices > 0)
         {
@@ -643,27 +648,23 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
                         break;
                     }
 
-                    // XML status logging every 2s
+                    // Status logging every 2s
                     if (elapsed > 0 && elapsed % 2000 < 100)
                     {
-                        std::wstring pollFile;
-                        if (config.debugXml) {
+                        TopoNode busTree = DoTopologyTreeWalk();
+                        TopologyCounts c = CountDevicesInTree(busTree);
+                        PipeSendTree(busTree);
+                        PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
+                        int cycled, total;
+                        GetEnumeratorStatusSince(phase4Baseline, cycled, total);
+                        Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
+                            elapsed / 1000, c.totalDevices, c.identifiedDevices,
+                            (int)g_discoveredDevices.size(), cycled, total);
+                        if (config.debugXml)
+                        {
                             wchar_t fname[64];
                             swprintf(fname, 64, L"hook_topo_bus_%ds.xml", elapsed / 1000);
-                            pollFile = LogPath(config.logDir, fname);
-                        } else {
-                            pollFile = LogPath(config.logDir, L"hook_topo_poll.xml");
-                        }
-                        if (SaveTopologyXML(pGlobals, pollFile.c_str()))
-                        {
-                            TopologyCounts c = CountDevicesInXML(pollFile.c_str());
-                            PipeSendTopology(pollFile.c_str());
-                            PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
-                            int cycled, total;
-                            GetEnumeratorStatusSince(phase4Baseline, cycled, total);
-                            Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
-                                elapsed / 1000, c.totalDevices, c.identifiedDevices,
-                                (int)g_discoveredDevices.size(), cycled, total);
+                            SaveTopologyXML(pGlobals, LogPath(config.logDir, fname).c_str());
                         }
                     }
 
@@ -706,27 +707,23 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
                         break;
                     }
 
-                    // XML status logging every 2s
+                    // Status logging every 2s
                     if (elapsed > 0 && elapsed % 2000 < 100)
                     {
-                        std::wstring pollFile;
-                        if (config.debugXml) {
+                        TopoNode bpTree = DoTopologyTreeWalk();
+                        TopologyCounts c = CountDevicesInTree(bpTree);
+                        PipeSendTree(bpTree);
+                        PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
+                        int cycled, total;
+                        GetEnumeratorStatusSince(phase4bBaseline, cycled, total);
+                        Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
+                            elapsed / 1000, c.totalDevices, c.identifiedDevices,
+                            (int)g_discoveredDevices.size(), cycled, total);
+                        if (config.debugXml)
+                        {
                             wchar_t fname[64];
                             swprintf(fname, 64, L"hook_topo_bp_%ds.xml", elapsed / 1000);
-                            pollFile = LogPath(config.logDir, fname);
-                        } else {
-                            pollFile = LogPath(config.logDir, L"hook_topo_poll.xml");
-                        }
-                        if (SaveTopologyXML(pGlobals, pollFile.c_str()))
-                        {
-                            TopologyCounts c = CountDevicesInXML(pollFile.c_str());
-                            PipeSendTopology(pollFile.c_str());
-                            PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
-                            int cycled, total;
-                            GetEnumeratorStatusSince(phase4bBaseline, cycled, total);
-                            Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
-                                elapsed / 1000, c.totalDevices, c.identifiedDevices,
-                                (int)g_discoveredDevices.size(), cycled, total);
+                            SaveTopologyXML(pGlobals, LogPath(config.logDir, fname).c_str());
                         }
                     }
 
@@ -764,17 +761,19 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
     Log(L"=== Final Results ===");
 
     {
-        std::wstring afterPath = LogPath(config.logDir, config.debugXml ? L"hook_topo_after.xml" : L"hook_topo_poll.xml");
-        SaveTopologyXML(pGlobals, afterPath.c_str());
-        PipeSendTopology(afterPath.c_str());
-    }
-    {
-        std::wstring afterPath = LogPath(config.logDir, config.debugXml ? L"hook_topo_after.xml" : L"hook_topo_poll.xml");
-        TopologyCounts fc = CountDevicesInXML(afterPath.c_str());
+        TopoNode finalTree = DoTopologyTreeWalk();
+        TopologyCounts fc = CountDevicesInTree(finalTree);
+        PipeSendTree(finalTree);
         PipeSendStatus(fc.totalDevices, fc.identifiedDevices, (int)g_discoveredDevices.size());
-        UpdateDeviceIPsFromXML(afterPath.c_str());
+
+        if (config.debugXml)
+        {
+            std::wstring afterPath = LogPath(config.logDir, L"hook_topo_after.xml");
+            SaveTopologyXML(pGlobals, afterPath.c_str());
+        }
+
         std::vector<std::wstring> allIPs = config.allIPs();
-        bool targetFound = !allIPs.empty() && IsTargetIdentifiedInXML(afterPath.c_str(), allIPs);
+        bool targetFound = !allIPs.empty() && IsTargetIdentifiedInTree(finalTree, allIPs);
         Log(L"Final topology: %d devices, %d identified",
             fc.totalDevices, fc.identifiedDevices);
         if (!allIPs.empty())
@@ -797,18 +796,15 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam)
             for (const auto& kv : g_deviceDetails)
             {
                 const DeviceInfo& d = kv.second;
-                fwprintf(resultFile, L"DEVICE: %s | %s\n",
+                fwprintf(resultFile, L"DEVICE: %s | %s | %s\n",
                     d.ip.empty() ? L"(no IP)" : d.ip.c_str(),
-                    d.productName.c_str());
+                    d.classname.empty() ? L"(no class)" : d.classname.c_str(),
+                    d.name.c_str());
             }
             fclose(resultFile);
             resultFile = nullptr;
         }
         Log(L"[OK] Results file written");
-
-        // Clean up temporary poll XML when not in debug-xml mode
-        if (!config.debugXml)
-            DeleteFileW(afterPath.c_str());
     }
 
     // Release all bus objects

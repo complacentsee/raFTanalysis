@@ -170,9 +170,15 @@ HRESULT DoBusBrowse()
             std::wstring objectId = DispatchGetString(pDevice, 2);
             Log(L"[BUS] Device %d: objectId='%s'", i, objectId.c_str());
 
+            // Extract classname via ITopologyObject DISPID 3
+            TopoObjectProps topoProps = GetTopoObjectProps(pDevice);
+            Log(L"[BUS] Device %d: class=\"%s\"", i, topoProps.classname.c_str());
+
             DeviceInfo info;
-            info.productName = devName;
+            info.name = devName;
+            info.classname = topoProps.classname;
             info.objectId = objectId;
+            info.slot = -1;
             if (!devName.empty())
                 g_deviceDetails[devName] = info;
         }
@@ -343,9 +349,15 @@ HRESULT DoBackplaneBrowse()
             std::wstring objectId = DispatchGetString(pDevice, 2);
             Log(L"[BP] Device %d: objectId='%s'", i, objectId.c_str());
 
+            // Extract classname via ITopologyObject DISPID 3
+            TopoObjectProps topoProps = GetTopoObjectProps(pDevice);
+            Log(L"[BP] Device %d: class=\"%s\"", i, topoProps.classname.c_str());
+
             DeviceInfo info;
-            info.productName = devName;
+            info.name = devName;
+            info.classname = topoProps.classname;
             info.objectId = objectId;
+            info.slot = -1;
             if (!devName.empty())
                 g_deviceDetails[devName] = info;
         }
@@ -621,6 +633,281 @@ HRESULT DoCleanupOnMainSTA()
 
     Log(L"[CLEANUP] DoCleanupOnMainSTA complete");
     return S_OK;
+}
+
+// ============================================================
+// Direct COM topology tree walk (no XML dependency)
+// ============================================================
+
+// Find the event sink associated with a bus (for address-device correlation)
+static DualEventSink* FindSinkForBus(IDispatch* pBusDisp)
+{
+    if (!pBusDisp) return nullptr;
+
+    // Get bus name via IRSObject::GetName vtable[7]
+    std::wstring busName;
+    IUnknown* pBusUnk = nullptr;
+    pBusDisp->QueryInterface(IID_IUnknown, (void**)&pBusUnk);
+    if (pBusUnk)
+    {
+        IUnknown* pRSObj = nullptr;
+        if (SUCCEEDED(pBusUnk->QueryInterface(IID_IRSObject, (void**)&pRSObj)) && pRSObj)
+        {
+            TryVtableGetLabel(pRSObj, 7, busName);
+            pRSObj->Release();
+        }
+        pBusUnk->Release();
+    }
+
+    if (busName.empty()) return nullptr;
+
+    // Match against registered enumerator sinks by label
+    for (auto& ei : g_enumerators)
+    {
+        if (!ei.pSink) continue;
+        if (ei.pSink->m_label.find(busName) != std::wstring::npos)
+            return ei.pSink;
+    }
+    return nullptr;
+}
+
+// Forward declarations for recursive walk
+static TopoNode WalkBus(IDispatch* pBusDisp, IUnknown* pBusRaw, bool isBackplane, int depth);
+static TopoNode WalkDevice(IDispatch* pDevice, int depth);
+
+static TopoNode WalkBus(IDispatch* pBusDisp, IUnknown* pBusRaw, bool isBackplane, int depth)
+{
+    TopoNode busNode;
+    busNode.type = TopoNode::Bus;
+
+    // Get bus properties
+    TopoObjectProps busProps = GetTopoObjectProps(pBusDisp);
+    busNode.name = busProps.name;
+    busNode.classname = busProps.classname;
+    busNode.objectId = busProps.objectId;
+
+    // Get Devices collection (DISPID 50)
+    IDispatch* pDevices = DispatchGetCollection(pBusDisp, 50);
+    if (!pDevices) return busNode;
+
+    std::vector<IDispatch*> devices = EnumerateCollection(pDevices);
+
+    // Get address list from event sink (if available)
+    DualEventSink* pSink = FindSinkForBus(pBusDisp);
+    std::vector<std::wstring> addresses;
+    if (pSink)
+    {
+        EnterCriticalSection(&pSink->m_cs);
+        addresses = pSink->m_addressesInOrder;
+        LeaveCriticalSection(&pSink->m_cs);
+    }
+
+    for (int i = 0; i < (int)devices.size(); i++)
+    {
+        IDispatch* pDevice = devices[i];
+        if (!pDevice) continue;
+
+        TopoNode devNode = WalkDevice(pDevice, depth + 1);
+
+        // Address correlation
+        if (isBackplane)
+        {
+            devNode.address = std::to_wstring(i);
+            devNode.addressType = L"Short";
+        }
+        else if (i < (int)addresses.size())
+        {
+            devNode.address = addresses[i];
+            devNode.addressType = L"String";
+        }
+
+        // Update global device details
+        if (!devNode.name.empty())
+        {
+            DeviceInfo info;
+            info.name = devNode.name;
+            info.classname = devNode.classname;
+            info.objectId = devNode.objectId;
+            info.ip = (devNode.addressType == L"String") ? devNode.address : L"";
+            info.slot = (devNode.addressType == L"Short") ? i : -1;
+            g_deviceDetails[devNode.name] = info;
+        }
+
+        busNode.children.push_back(std::move(devNode));
+        pDevice->Release();
+    }
+
+    pDevices->Release();
+    return busNode;
+}
+
+static TopoNode WalkDevice(IDispatch* pDevice, int depth)
+{
+    TopoNode devNode;
+    devNode.type = TopoNode::Device;
+
+    TopoObjectProps props = GetTopoObjectProps(pDevice);
+    devNode.name = props.name;
+    devNode.classname = props.classname;
+    devNode.objectId = props.objectId;
+
+    // Depth guard to prevent infinite recursion (max: Workstation→Ethernet→Device→Backplane→Module = 4)
+    if (depth >= 4) return devNode;
+
+    // Check for backplane port (IRSTopologyDevice vtable[19])
+    IUnknown* pDevVtable = nullptr;
+    pDevice->QueryInterface(IID_IRSTopologyDevice, (void**)&pDevVtable);
+    if (!pDevVtable) return devNode;
+
+    IUnknown* pBackplanePort = nullptr;
+    HRESULT hrBP = TryVtableGetObject(pDevVtable, 19, &pBackplanePort);
+    pDevVtable->Release();
+
+    if (FAILED(hrBP) || !pBackplanePort) return devNode;
+
+    // Get bus from backplane port via IRSTopologyPort::GetBus vtable[10]
+    TopoNode portNode;
+    portNode.type = TopoNode::Port;
+
+    IUnknown* pPortVtable = nullptr;
+    HRESULT hrPortQI = pBackplanePort->QueryInterface(IID_IRSTopologyPort, (void**)&pPortVtable);
+    if (SUCCEEDED(hrPortQI) && pPortVtable)
+    {
+        IUnknown* pBusRaw = nullptr;
+        HRESULT hrGetBus = TryVtableGetObject(pPortVtable, 10, &pBusRaw);
+
+        if (SUCCEEDED(hrGetBus) && pBusRaw)
+        {
+            // Get port name from bus via IRSObject::GetName
+            IUnknown* pBusRSObj = nullptr;
+            if (SUCCEEDED(pBusRaw->QueryInterface(IID_IRSObject, (void**)&pBusRSObj)) && pBusRSObj)
+            {
+                TryVtableGetLabel(pBusRSObj, 7, portNode.name);
+                pBusRSObj->Release();
+            }
+
+            IDispatch* pBusDisp = nullptr;
+            pBusRaw->QueryInterface(IID_ITopologyBus, (void**)&pBusDisp);
+            if (!pBusDisp)
+                pBusRaw->QueryInterface(IID_ITopologyChassis, (void**)&pBusDisp);
+            if (pBusDisp)
+            {
+                TopoNode childBus = WalkBus(pBusDisp, pBusRaw, true, depth + 1);
+                portNode.children.push_back(std::move(childBus));
+                pBusDisp->Release();
+            }
+            pBusRaw->Release();
+        }
+        pPortVtable->Release();
+    }
+    pBackplanePort->Release();
+
+    if (!portNode.children.empty())
+        devNode.children.push_back(std::move(portNode));
+
+    return devNode;
+}
+
+TopoNode DoTopologyTreeWalk()
+{
+    Log(L"[TREE] DoTopologyTreeWalk starting");
+    TopoNode root;
+    root.type = TopoNode::Workstation;
+
+    // Get workstation via the same COM chain as GetBusDispatch
+    IHarmonyConnector* pHarmony = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_HarmonyServices, NULL, CLSCTX_ALL,
+                                   IID_IHarmonyConnector, (void**)&pHarmony);
+    if (FAILED(hr)) { Log(L"[TREE] FAIL HarmonyServices: 0x%08x", hr); return root; }
+    pHarmony->SetServerOptions(0, L"");
+
+    IRSTopologyGlobals* pGlobals = nullptr;
+    {
+        IUnknown* pUnk = nullptr;
+        hr = pHarmony->GetSpecialObject(&CLSID_RSTopologyGlobals, &IID_IRSTopologyGlobals, &pUnk);
+        if (FAILED(hr)) { pHarmony->Release(); return root; }
+        pUnk->QueryInterface(IID_IRSTopologyGlobals, (void**)&pGlobals);
+        pUnk->Release();
+    }
+
+    IRSProject* pProject = nullptr;
+    {
+        IRSProjectGlobal* pPG = nullptr;
+        hr = CoCreateInstance(CLSID_RSProjectGlobal, NULL, CLSCTX_ALL,
+                              IID_IRSProjectGlobal, (void**)&pPG);
+        if (FAILED(hr)) { pGlobals->Release(); pHarmony->Release(); return root; }
+        hr = pPG->OpenProject(L"", 0, NULL, NULL, &IID_IRSProject, (void**)&pProject);
+        pPG->Release();
+        if (FAILED(hr)) { pGlobals->Release(); pHarmony->Release(); return root; }
+    }
+
+    IUnknown* pWorkstation = nullptr;
+    hr = pGlobals->GetThisWorkstationObject(pProject, &pWorkstation);
+    pProject->Release(); pGlobals->Release(); pHarmony->Release();
+    if (FAILED(hr) || !pWorkstation) { Log(L"[TREE] FAIL Workstation: 0x%08x", hr); return root; }
+
+    // Get workstation as ITopologyDevice_Dual for bus access
+    IDispatch* pWsDisp = nullptr;
+    pWorkstation->QueryInterface(IID_ITopologyDevice_Dual, (void**)&pWsDisp);
+    if (!pWsDisp) { pWorkstation->Release(); return root; }
+
+    // Get workstation properties
+    TopoObjectProps wsProps = GetTopoObjectProps(pWsDisp);
+    root.name = wsProps.name;
+    root.classname = L"Workstation";
+    root.objectId = wsProps.objectId;
+
+    // Walk each configured driver's bus
+    if (g_pSharedConfig)
+    {
+        for (auto& drv : g_pSharedConfig->drivers)
+        {
+            // Get bus via DISPID 38 (same as GetBusDispatch)
+            VARIANT argName;
+            VariantInit(&argName);
+            argName.vt = VT_BSTR;
+            argName.bstrVal = SysAllocString(drv.name.c_str());
+            DISPPARAMS dp = { &argName, nullptr, 1, 0 };
+            VARIANT varBus;
+            VariantInit(&varBus);
+            hr = pWsDisp->Invoke(38, IID_NULL, LOCALE_USER_DEFAULT,
+                                  DISPATCH_PROPERTYGET, &dp, &varBus, nullptr, nullptr);
+
+            if (SUCCEEDED(hr) && (varBus.vt == VT_DISPATCH || varBus.vt == VT_UNKNOWN) &&
+                (varBus.vt == VT_DISPATCH ? (void*)varBus.pdispVal : (void*)varBus.punkVal))
+            {
+                IUnknown* pBusUnk = (varBus.vt == VT_DISPATCH)
+                    ? (IUnknown*)varBus.pdispVal : varBus.punkVal;
+                pBusUnk->AddRef();
+
+                IDispatch* pBusDisp = nullptr;
+                pBusUnk->QueryInterface(IID_ITopologyBus, (void**)&pBusDisp);
+
+                if (pBusDisp)
+                {
+                    // Wrap in a port node (mirrors XML: device > port > bus)
+                    TopoNode portNode;
+                    portNode.type = TopoNode::Port;
+                    portNode.name = drv.name;
+
+                    TopoNode busNode = WalkBus(pBusDisp, pBusUnk, false, 1);
+                    portNode.children.push_back(std::move(busNode));
+                    root.children.push_back(std::move(portNode));
+
+                    pBusDisp->Release();
+                }
+                pBusUnk->Release();
+            }
+            VariantClear(&argName);
+            VariantClear(&varBus);
+        }
+    }
+
+    pWsDisp->Release();
+    pWorkstation->Release();
+
+    Log(L"[TREE] DoTopologyTreeWalk complete");
+    return root;
 }
 
 // ============================================================
@@ -969,66 +1256,64 @@ void RunMonitorLoop(const HookConfig& config, IRSTopologyGlobals* pGlobals, cons
         if (elapsed > 0 && elapsed % 10000 < 100)
         {
             snapshotNum++;
-            std::wstring snapFile;
-            if (config.debugXml) {
+            TopoNode snapTree = DoTopologyTreeWalk();
+            TopologyCounts c = CountDevicesInTree(snapTree);
+            PipeSendTree(snapTree);
+            PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
+            Log(L"[MONITOR] Snapshot %d @ %ds: %d devices, %d identified, %d events",
+                snapshotNum, elapsed / 1000, c.totalDevices, c.identifiedDevices,
+                (int)g_discoveredDevices.size());
+
+            if (config.debugXml)
+            {
                 wchar_t fname[64];
                 swprintf(fname, 64, L"hook_topo_monitor_%d.xml", snapshotNum);
-                snapFile = LogPath(config.logDir, fname);
-            } else {
-                snapFile = LogPath(config.logDir, L"hook_topo_poll.xml");
+                SaveTopologyXML(pGlobals, LogPath(config.logDir, fname).c_str());
             }
-            if (SaveTopologyXML(pGlobals, snapFile.c_str()))
+
+            if (!busBrowseDone && c.identifiedDevices > 0)
             {
-                TopologyCounts c = CountDevicesInXML(snapFile.c_str());
-                PipeSendTopology(snapFile.c_str());
-                PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
-                Log(L"[MONITOR] Snapshot %d @ %ds: %d devices, %d identified, %d events",
-                    snapshotNum, elapsed / 1000, c.totalDevices, c.identifiedDevices,
-                    (int)g_discoveredDevices.size());
-
-                if (!busBrowseDone && c.identifiedDevices > 0)
-                {
-                    Log(L"[MONITOR] Devices identified — triggering bus browse");
-                    g_capturedBuses.clear();
-                    g_captureBuses = true;
-                    HRESULT hrBus = ExecuteOnMainSTA(DoBusBrowse);
-                    Log(L"[MONITOR] Bus browse: hr=0x%08x", hrBus);
-                    busBrowseDone = true;
-                }
-
-                if (busBrowseDone && !backplaneBrowseDone && !g_capturedBuses.empty())
-                {
-                    g_captureBuses = false;
-                    Log(L"[MONITOR] Captured %d buses — triggering backplane browse", (int)g_capturedBuses.size());
-                    HRESULT hrBP = ExecuteOnMainSTA(DoBackplaneBrowse);
-                    Log(L"[MONITOR] Backplane browse: hr=0x%08x", hrBP);
-                    backplaneBrowseDone = true;
-                }
-
-                UpdateDeviceIPsFromXML(snapFile.c_str());
-
-                std::wstring resultsPath = LogPath(config.logDir, L"hook_results.txt");
-                FILE* rf = _wfopen(resultsPath.c_str(), L"w, ccs=UTF-8");
-                if (rf)
-                {
-                    fwprintf(rf, L"MODE: monitor\n");
-                    fwprintf(rf, L"SNAPSHOT: %d\n", snapshotNum);
-                    fwprintf(rf, L"DEVICES_IDENTIFIED: %d\n", c.identifiedDevices);
-                    fwprintf(rf, L"DEVICES_TOTAL: %d\n", c.totalDevices);
-                    fwprintf(rf, L"EVENTS: %d\n", (int)g_discoveredDevices.size());
-                    fwprintf(rf, L"ELAPSED: %d\n", elapsed / 1000);
-                    for (const auto& kv : g_deviceDetails)
-                    {
-                        const DeviceInfo& d = kv.second;
-                        fwprintf(rf, L"DEVICE: %s | %s\n",
-                            d.ip.empty() ? L"(no IP)" : d.ip.c_str(),
-                            d.productName.c_str());
-                    }
-                    fclose(rf);
-                }
-
-                lastIdentified = c.identifiedDevices;
+                Log(L"[MONITOR] Devices identified — triggering bus browse");
+                g_capturedBuses.clear();
+                g_captureBuses = true;
+                HRESULT hrBus = ExecuteOnMainSTA(DoBusBrowse);
+                Log(L"[MONITOR] Bus browse: hr=0x%08x", hrBus);
+                busBrowseDone = true;
             }
+
+            if (busBrowseDone && !backplaneBrowseDone && !g_capturedBuses.empty())
+            {
+                g_captureBuses = false;
+                Log(L"[MONITOR] Captured %d buses — triggering backplane browse", (int)g_capturedBuses.size());
+                HRESULT hrBP = ExecuteOnMainSTA(DoBackplaneBrowse);
+                Log(L"[MONITOR] Backplane browse: hr=0x%08x", hrBP);
+                backplaneBrowseDone = true;
+            }
+
+            // g_deviceDetails already populated by tree walk
+
+            std::wstring resultsPath = LogPath(config.logDir, L"hook_results.txt");
+            FILE* rf = _wfopen(resultsPath.c_str(), L"w, ccs=UTF-8");
+            if (rf)
+            {
+                fwprintf(rf, L"MODE: monitor\n");
+                fwprintf(rf, L"SNAPSHOT: %d\n", snapshotNum);
+                fwprintf(rf, L"DEVICES_IDENTIFIED: %d\n", c.identifiedDevices);
+                fwprintf(rf, L"DEVICES_TOTAL: %d\n", c.totalDevices);
+                fwprintf(rf, L"EVENTS: %d\n", (int)g_discoveredDevices.size());
+                fwprintf(rf, L"ELAPSED: %d\n", elapsed / 1000);
+                for (const auto& kv : g_deviceDetails)
+                {
+                    const DeviceInfo& d = kv.second;
+                    fwprintf(rf, L"DEVICE: %s | %s | %s\n",
+                        d.ip.empty() ? L"(no IP)" : d.ip.c_str(),
+                        d.classname.empty() ? L"(no class)" : d.classname.c_str(),
+                        d.name.c_str());
+                }
+                fclose(rf);
+            }
+
+            lastIdentified = c.identifiedDevices;
         }
     }
 
@@ -1040,10 +1325,16 @@ void RunMonitorLoop(const HookConfig& config, IRSTopologyGlobals* pGlobals, cons
 
     DWORD totalElapsed = GetTickCount() - startTick;
     {
-        std::wstring finalSnap = LogPath(config.logDir, config.debugXml ? L"hook_topo_monitor_final.xml" : L"hook_topo_poll.xml");
-        SaveTopologyXML(pGlobals, finalSnap.c_str());
-        TopologyCounts fc = CountDevicesInXML(finalSnap.c_str());
-        UpdateDeviceIPsFromXML(finalSnap.c_str());
+        TopoNode finalTree = DoTopologyTreeWalk();
+        TopologyCounts fc = CountDevicesInTree(finalTree);
+
+        if (config.debugXml)
+        {
+            std::wstring finalSnap = LogPath(config.logDir, L"hook_topo_monitor_final.xml");
+            SaveTopologyXML(pGlobals, finalSnap.c_str());
+        }
+
+        // g_deviceDetails already populated by tree walk
 
         std::wstring resultsPath = LogPath(config.logDir, L"hook_results.txt");
         FILE* rf = _wfopen(resultsPath.c_str(), L"w, ccs=UTF-8");
@@ -1058,21 +1349,16 @@ void RunMonitorLoop(const HookConfig& config, IRSTopologyGlobals* pGlobals, cons
             for (const auto& kv : g_deviceDetails)
             {
                 const DeviceInfo& d = kv.second;
-                fwprintf(rf, L"DEVICE: %s | %s\n",
+                fwprintf(rf, L"DEVICE: %s | %s | %s\n",
                     d.ip.empty() ? L"(no IP)" : d.ip.c_str(),
-                    d.productName.c_str());
+                    d.classname.empty() ? L"(no class)" : d.classname.c_str(),
+                    d.name.c_str());
             }
             fclose(rf);
         }
 
         Log(L"[MONITOR] Final: %d devices, %d identified, %d events, %ds elapsed",
             fc.totalDevices, fc.identifiedDevices, (int)g_discoveredDevices.size(), totalElapsed / 1000);
-    }
-
-    if (!config.debugXml)
-    {
-        std::wstring pollPath = LogPath(config.logDir, L"hook_topo_poll.xml");
-        DeleteFileW(pollPath.c_str());
     }
 
     Log(L"[MONITOR] Monitor loop complete");

@@ -43,6 +43,7 @@ public:
     // Cycle detection: track seen addresses to detect when browse repeats
     CRITICAL_SECTION m_cs;
     std::set<std::wstring> m_seenAddresses;
+    std::vector<std::wstring> m_addressesInOrder;  // Preserves discovery order for address-device correlation
     volatile bool m_cycleComplete;  // true when repeat address, BrowseCycled, or BrowseEnded
     volatile bool m_browseEnded;    // true when BrowseEnded fires
     int m_addressCount;             // total Found() calls

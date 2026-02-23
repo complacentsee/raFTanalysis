@@ -165,7 +165,8 @@ void UpdateDeviceIPsFromXML(const wchar_t* filename)
                     else
                     {
                         DeviceInfo info;
-                        info.productName = nameW;
+                        info.name = nameW;
+                        info.slot = -1;
                         info.ip = ipW;
                         g_deviceDetails[nameW] = info;
                     }
@@ -173,4 +174,54 @@ void UpdateDeviceIPsFromXML(const wchar_t* filename)
             }
         }
     }
+}
+
+// ============================================================
+// Tree-based topology functions (no XML dependency)
+// ============================================================
+
+static void CountDevicesRecursive(const TopoNode& node, TopologyCounts& counts)
+{
+    if (node.type == TopoNode::Device && !node.name.empty())
+    {
+        counts.totalDevices++;
+        if (!node.classname.empty() &&
+            node.classname != L"Unrecognized Device" &&
+            node.classname != L"Workstation")
+            counts.identifiedDevices++;
+    }
+    for (const auto& child : node.children)
+        CountDevicesRecursive(child, counts);
+}
+
+TopologyCounts CountDevicesInTree(const TopoNode& root)
+{
+    TopologyCounts counts = { 0, 0 };
+    CountDevicesRecursive(root, counts);
+    return counts;
+}
+
+static bool FindTargetIPInTree(const TopoNode& node, const std::vector<std::wstring>& targetIPs)
+{
+    if (node.type == TopoNode::Device && node.addressType == L"String")
+    {
+        for (const auto& ip : targetIPs)
+        {
+            if (node.address == ip &&
+                !node.classname.empty() &&
+                node.classname != L"Unrecognized Device")
+                return true;
+        }
+    }
+    for (const auto& child : node.children)
+    {
+        if (FindTargetIPInTree(child, targetIPs))
+            return true;
+    }
+    return false;
+}
+
+bool IsTargetIdentifiedInTree(const TopoNode& root, const std::vector<std::wstring>& targetIPs)
+{
+    return FindTargetIPInTree(root, targetIPs);
 }
