@@ -22,6 +22,13 @@ jobs:
       - name: Build RSLinxHook (Release|Win32)
         run: msbuild RSLinxHook\RSLinxHook.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /verbosity:minimal
 
+      - name: Collect binaries
+        run: |
+          New-Item -ItemType Directory -Force -Path Release | Out-Null
+          Copy-Item RSLinxBrowse\Release\RSLinxBrowse.exe Release\
+          Copy-Item RSLinxHook\Release\RSLinxHook.dll Release\
+        shell: pwsh
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

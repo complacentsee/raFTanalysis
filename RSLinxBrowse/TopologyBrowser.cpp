@@ -5,12 +5,12 @@
  */
 
 #include <winsock2.h>  // Must come before windows.h (via TopologyBrowser.h)
+#include <ocidl.h>     // IConnectionPointContainer, IConnectionPoint, IEnumConnectionPoints
 #include "TopologyBrowser.h"
 #include <iostream>
 #include <iomanip>
 #include <chrono>
 #include <thread>
-#include <atlbase.h>
 #include <fstream>
 #include <sstream>
 
