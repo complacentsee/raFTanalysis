@@ -17,3 +17,11 @@ void PipeSendTopology(const wchar_t* xmlPath);
 void PipeSendStatus(int total, int identified, int events);
 bool PipeCheckStop();
 std::wstring LogPath(const std::wstring& logDir, const wchar_t* filename);
+
+// Pipe server functions (hook is server; CLI connects as client)
+bool PipeCreateServer();
+bool PipeAcceptClient();
+void PipeDisconnectClient();
+void PipeDestroyServer();
+bool PipeReadLine(char* buf, int maxLen);
+void PipeSendLine(const char* line);

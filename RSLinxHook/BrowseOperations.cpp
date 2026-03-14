@@ -15,6 +15,9 @@ std::vector<EnumeratorInfo> g_enumerators;
 DualEventSink* g_pMainSink = nullptr;
 IUnknown* g_pMainEnumUnk = nullptr;
 
+std::set<std::wstring> g_browsedDrivers;
+std::set<std::wstring> g_browsedBackplanes;
+
 // ============================================================
 // Enumerator tracking
 // ============================================================

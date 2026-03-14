@@ -32,7 +32,7 @@ bool ReadConfigFromPipe(HookConfig& config)
             std::string line = accumulated.substr(0, pos);
             accumulated.erase(0, pos + 1);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line == "C|END") return !config.drivers.empty();
+            if (line == "C|END") return true;
             if (line.length() >= 2 && line[0] == 'C' && line[1] == '|') {
                 std::wstring wval = Utf8ToWide(line.c_str() + 2);
                 if (wval == L"MODE=inject") config.mode = HookMode::Inject;

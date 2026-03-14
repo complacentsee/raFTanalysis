@@ -33,37 +33,31 @@ struct DriverSpec {
 };
 
 // ============================================================
-// Named Pipe Server — bidirectional IPC with RSLinxHook.dll
+// Named Pipe Client — hook is now the server; CLI connects
 // ============================================================
 
 static HANDLE g_hPipeServer = INVALID_HANDLE_VALUE;
 
-static bool CreatePipeServer()
+// Try to connect to the hook's pipe server within timeoutMs.
+// Returns true on success.
+static bool TryConnectToPipe(DWORD timeoutMs)
 {
-    g_hPipeServer = CreateNamedPipeW(
-        L"\\\\.\\pipe\\RSLinxHook",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 4096, 4096, 0, NULL);
-    return g_hPipeServer != INVALID_HANDLE_VALUE;
-}
+    DWORD deadline = GetTickCount() + timeoutMs;
+    while (GetTickCount() < deadline)
+    {
+        g_hPipeServer = CreateFileW(L"\\\\.\\pipe\\RSLinxHook",
+            GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (g_hPipeServer != INVALID_HANDLE_VALUE)
+            return true;
 
-static DWORD WINAPI ConnectPipeThread(LPVOID)
-{
-    ConnectNamedPipe(g_hPipeServer, NULL);
-    return 0;
-}
-
-static bool WaitForPipeConnection(DWORD timeoutMs)
-{
-    HANDLE hThread = CreateThread(NULL, 0, ConnectPipeThread, NULL, 0, NULL);
-    if (!hThread) return false;
-    DWORD result = WaitForSingleObject(hThread, timeoutMs);
-    CloseHandle(hThread);
-    if (result == WAIT_OBJECT_0) return true;
-    // Timeout — cancel by closing pipe (unblocks ConnectNamedPipe)
-    CloseHandle(g_hPipeServer);
-    g_hPipeServer = INVALID_HANDLE_VALUE;
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_BUSY)
+            WaitNamedPipeW(L"\\\\.\\pipe\\RSLinxHook", 1000);
+        else if (err == ERROR_FILE_NOT_FOUND)
+            Sleep(200);
+        else
+            return false;  // unexpected error
+    }
     return false;
 }
 
@@ -112,15 +106,14 @@ static void PipeSendStop()
 static void PipeClose()
 {
     if (g_hPipeServer != INVALID_HANDLE_VALUE) {
-        DisconnectNamedPipe(g_hPipeServer);
-        CloseHandle(g_hPipeServer);
+        CloseHandle(g_hPipeServer);  // CLI is now a client; no DisconnectNamedPipe
         g_hPipeServer = INVALID_HANDLE_VALUE;
     }
 }
 
-// Read pipe messages, print L| log lines to console in real-time.
-// Returns true when D| received or pipe disconnects, false on timeout.
-static bool PipeReadLoop(DWORD timeoutMs)
+// Read pipe messages until D|, capturing R| result into resultLine (if non-null).
+// Prints L| log lines to console. Returns true when D| received.
+static bool PipeReadUntilDone(DWORD timeoutMs, std::string* resultLine = nullptr)
 {
     // Use WriteConsoleW for Unicode-safe output (wcout breaks on em dashes etc.)
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -176,6 +169,9 @@ static bool PipeReadLoop(DWORD timeoutMs)
             else if (line.length() >= 2 && line[0] == 'S' && line[1] == '|') {
                 // Status update — could print periodically if desired
             }
+            else if (line.length() >= 2 && line[0] == 'R' && line[1] == '|') {
+                if (resultLine) *resultLine = line;
+            }
             else if (line.length() >= 2 && line[0] == 'D' && line[1] == '|') {
                 return true; // done
             }
@@ -184,6 +180,8 @@ static bool PipeReadLoop(DWORD timeoutMs)
     }
 }
 
+
+static bool PipeReadLoop(DWORD timeoutMs) { return PipeReadUntilDone(timeoutMs); }
 
 // Build full path from log directory + filename
 static std::wstring LogPath(const std::wstring& logDir, const wchar_t* filename)
@@ -269,7 +267,7 @@ static bool InjectDLL(DWORD pid, const std::wstring& dllPath)
         FALSE, pid);
     if (!hProcess && GetLastError() == ERROR_ACCESS_DENIED)
     {
-        std::wcout << L"[INFO] Access denied — enabling SeDebugPrivilege (service mode)..." << std::endl;
+        std::wcout << L"[INFO] Access denied - enabling SeDebugPrivilege (service mode)..." << std::endl;
         if (EnableDebugPrivilege())
         {
             std::wcout << L"[OK] SeDebugPrivilege enabled" << std::endl;
@@ -279,7 +277,7 @@ static bool InjectDLL(DWORD pid, const std::wstring& dllPath)
         }
         else
         {
-            std::wcerr << L"[FAIL] Could not enable SeDebugPrivilege — run as Administrator" << std::endl;
+            std::wcerr << L"[FAIL] Could not enable SeDebugPrivilege - run as Administrator" << std::endl;
             return false;
         }
     }
@@ -674,19 +672,7 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
     }
     std::wcout << L"[OK] Found RSLinx.exe PID: " << rslinxPid << std::endl;
 
-    // Step 2: Create pipe server BEFORE injection
-    std::wcout << L"[INFO] Creating named pipe server..." << std::endl;
-    if (!CreatePipeServer())
-    {
-        std::wcerr << L"[FAIL] Cannot create named pipe: " << GetLastError() << std::endl;
-        return 1;
-    }
-
-    // Step 3: Delete old results/log files
-    DeleteFileW(LogPath(logDir, L"hook_results.txt").c_str());
-    DeleteFileW(LogPath(logDir, L"hook_log.txt").c_str());
-
-    // Step 4: Find RSLinxHook.dll path (same directory as our exe)
+    // Step 3: Find RSLinxHook.dll path (same directory as our exe)
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring dllPath(exePath);
@@ -699,7 +685,6 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
     if (attrs == INVALID_FILE_ATTRIBUTES)
     {
         std::wcerr << L"[FAIL] RSLinxHook.dll not found at: " << dllPath << std::endl;
-        PipeClose();
         return 1;
     }
     std::wcout << L"[OK] DLL path: " << dllPath << std::endl;
@@ -714,29 +699,37 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
             std::wcout << L"    " << ip << std::endl;
     }
 
-    // Step 5: Eject any previously loaded instance, then inject DLL
-    EjectDLL(rslinxPid, dllPath);
-    Sleep(500);
-
-    if (!InjectDLL(rslinxPid, dllPath))
+    // Step 4: Smart injection — detect if hook already running
+    std::wcout << L"[INFO] Checking if hook is already running..." << std::endl;
+    bool alreadyLoaded = TryConnectToPipe(500);
+    if (!alreadyLoaded)
     {
-        std::wcerr << L"[FAIL] DLL injection failed" << std::endl;
-        PipeClose();
-        return 1;
+        std::wcout << L"[INFO] Hook not running, injecting DLL..." << std::endl;
+        if (!InjectDLL(rslinxPid, dllPath))
+        {
+            std::wcerr << L"[FAIL] DLL injection failed" << std::endl;
+            return 1;
+        }
+        std::wcout << L"[INFO] Waiting for hook pipe server..." << std::endl;
+        if (!TryConnectToPipe(10000))
+        {
+            std::wcerr << L"[FAIL] Hook pipe did not appear within 10s" << std::endl;
+            return 1;
+        }
     }
-
-    // Step 6: Wait for hook to connect to pipe
-    std::wcout << L"[INFO] Waiting for hook to connect to pipe..." << std::endl;
-    if (!WaitForPipeConnection(10000))
+    else
     {
-        std::wcerr << L"[FAIL] Hook did not connect to pipe within 10s" << std::endl;
-        PipeClose();
-        EjectDLL(rslinxPid, dllPath);
-        return 1;
+        std::wcout << L"[OK] Hook already running - skipping injection" << std::endl;
     }
-    std::wcout << L"[OK] Hook connected via pipe" << std::endl;
+    std::wcout << L"[OK] Connected to hook pipe" << std::endl;
 
     // Step 7: Send config over pipe
+    if (!alreadyLoaded)
+    {
+        // Clear old results/log now that we know we did a fresh injection
+        DeleteFileW(LogPath(logDir, L"hook_results.txt").c_str());
+        DeleteFileW(LogPath(logDir, L"hook_log.txt").c_str());
+    }
     PipeSendConfig(drivers, driverNeedsHotLoad, logDir, debugXml, false, probeDispids);
     std::wcout << L"[OK] Config sent via pipe" << std::endl;
 
@@ -744,11 +737,9 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
     std::wcout << std::endl << L"--- Hook Log (live) ---" << std::endl;
     PipeReadLoop(210000);
 
-    // Step 9: Cleanup pipe and eject DLL
+    // Step 9: Send STOP so hook returns to accept-wait, then close our end
     PipeSendStop();
     PipeClose();
-    Sleep(500);
-    EjectDLL(rslinxPid, dllPath);
 
     // Step 10: Read and display results (hook_results.txt still written by hook)
     PrintHeader(L"Hook Results");
@@ -772,9 +763,13 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
         }
         resultFile.close();
     }
-    else
+    else if (!alreadyLoaded)
     {
         std::wcerr << L"[FAIL] No results file - hook may have failed" << std::endl;
+    }
+    else
+    {
+        std::wcout << L"[INFO] No new browse (hook already running), using previous results" << std::endl;
     }
 
     // Step 8: Save topology after injection (debug-xml only)
@@ -801,6 +796,11 @@ static int RunInjectMode(const std::vector<DriverSpec>& drivers, const std::wstr
     }
 
     PrintHeader(L"Final Result");
+    if (alreadyLoaded && totalIdentified == 0)
+    {
+        std::wcout << L"[OK] Hook already had topology - reconnect successful" << std::endl;
+        return 0;
+    }
     std::wcout << L"[OK] Browse complete -- " << drivers.size() << L" driver(s), "
                << totalIdentified << L" devices identified" << std::endl;
 
@@ -952,19 +952,7 @@ static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wst
     }
     std::wcout << L"[OK] Found RSLinx.exe PID: " << rslinxPid << std::endl;
 
-    // Step 2: Create pipe server BEFORE injection
-    std::wcout << L"[INFO] Creating named pipe server..." << std::endl;
-    if (!CreatePipeServer())
-    {
-        std::wcerr << L"[FAIL] Cannot create named pipe: " << GetLastError() << std::endl;
-        return 1;
-    }
-
-    // Step 3: Delete old results/log files
-    DeleteFileW(LogPath(logDir, L"hook_results.txt").c_str());
-    DeleteFileW(LogPath(logDir, L"hook_log.txt").c_str());
-
-    // Step 4: Find RSLinxHook.dll path (same directory as our exe)
+    // Step 3: Find RSLinxHook.dll path
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring dllPath(exePath);
@@ -974,7 +962,6 @@ static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wst
     if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         std::wcerr << L"[FAIL] DLL not found: " << dllPath << std::endl;
-        PipeClose();
         return 1;
     }
     std::wcout << L"[OK] DLL path: " << dllPath << std::endl;
@@ -987,29 +974,36 @@ static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wst
             std::wcout << L"    " << ip << std::endl;
     }
 
-    // Step 5: Eject any previous instance, then inject
-    EjectDLL(rslinxPid, dllPath);
-    Sleep(500);
-
-    if (!InjectDLL(rslinxPid, dllPath))
+    // Step 4: Smart injection — detect if hook already running
+    std::wcout << L"[INFO] Checking if hook is already running..." << std::endl;
+    bool alreadyLoaded = TryConnectToPipe(500);
+    if (!alreadyLoaded)
     {
-        std::wcerr << L"[FAIL] DLL injection failed" << std::endl;
-        PipeClose();
-        return 1;
+        std::wcout << L"[INFO] Hook not running, injecting DLL..." << std::endl;
+        if (!InjectDLL(rslinxPid, dllPath))
+        {
+            std::wcerr << L"[FAIL] DLL injection failed" << std::endl;
+            return 1;
+        }
+        std::wcout << L"[INFO] Waiting for hook pipe server..." << std::endl;
+        if (!TryConnectToPipe(10000))
+        {
+            std::wcerr << L"[FAIL] Hook pipe did not appear within 10s" << std::endl;
+            return 1;
+        }
     }
-
-    // Step 6: Wait for hook to connect to pipe
-    std::wcout << L"[INFO] Waiting for hook to connect to pipe..." << std::endl;
-    if (!WaitForPipeConnection(10000))
+    else
     {
-        std::wcerr << L"[FAIL] Hook did not connect to pipe within 10s" << std::endl;
-        PipeClose();
-        EjectDLL(rslinxPid, dllPath);
-        return 1;
+        std::wcout << L"[OK] Hook already running - skipping injection" << std::endl;
     }
-    std::wcout << L"[OK] Hook connected via pipe" << std::endl;
+    std::wcout << L"[OK] Connected to hook pipe" << std::endl;
 
     // Step 7: Send config over pipe (MODE=inject preserved — monitor flag only skips driver creation)
+    if (!alreadyLoaded)
+    {
+        DeleteFileW(LogPath(logDir, L"hook_results.txt").c_str());
+        DeleteFileW(LogPath(logDir, L"hook_log.txt").c_str());
+    }
     std::vector<bool> noHotLoad(drivers.size(), false);
     PipeSendConfig(drivers, noHotLoad, logDir, debugXml, false, probeDispids);
     std::wcout << L"[OK] Config sent via pipe" << std::endl;
@@ -1018,11 +1012,9 @@ static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wst
     std::wcout << std::endl << L"--- Hook Log (live) ---" << std::endl;
     PipeReadLoop(120000);
 
-    // Step 9: Cleanup pipe and eject DLL
+    // Step 9: Send STOP so hook returns to accept-wait, then close our end
     PipeSendStop();
     PipeClose();
-    Sleep(500);
-    EjectDLL(rslinxPid, dllPath);
 
     // Step 10: Read results file (hook_results.txt still written by hook)
     PrintHeader(L"Hook Results");
@@ -1078,6 +1070,103 @@ static int RunMonitorMode(const std::vector<DriverSpec>& drivers, const std::wst
 // Entry Point
 // ============================================================
 
+// ============================================================
+// Query Mode — connect to running hook, send Q|path, print R|
+// ============================================================
+
+static int RunQueryMode(const std::wstring& queryPath, const std::wstring& logDir)
+{
+    PrintHeader(L"RSLinx Hook Query Mode");
+
+    // Find RSLinxHook.dll path
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring dllPath(exePath);
+    size_t lastSlash = dllPath.rfind(L'\\');
+    if (lastSlash != std::wstring::npos) dllPath = dllPath.substr(0, lastSlash + 1);
+    dllPath += L"RSLinxHook.dll";
+
+    // Try to connect; inject if not already running
+    std::wcout << L"[INFO] Connecting to hook..." << std::endl;
+    bool alreadyLoaded = TryConnectToPipe(500);
+    if (!alreadyLoaded)
+    {
+        DWORD rslinxPid = FindProcessByName(L"RSLinx.exe");
+        if (rslinxPid == 0) rslinxPid = FindProcessByName(L"RSLINX.EXE");
+        if (rslinxPid == 0) rslinxPid = FindProcessByName(L"rslinx.exe");
+        if (rslinxPid == 0)
+        {
+            std::wcerr << L"[FAIL] RSLinx.exe not found" << std::endl;
+            return 1;
+        }
+        if (!InjectDLL(rslinxPid, dllPath))
+        {
+            std::wcerr << L"[FAIL] DLL injection failed" << std::endl;
+            return 1;
+        }
+        if (!TryConnectToPipe(10000))
+        {
+            std::wcerr << L"[FAIL] Hook pipe did not appear within 10s" << std::endl;
+            return 1;
+        }
+        // Fresh inject: send minimal config so hook initialises but skips browse
+        PipeSendLine("C|MODE=inject");
+        PipeSendLine("C|DRIVER=Test");
+        PipeSendLine("C|END");
+    }
+    else
+    {
+        // Already running: still need to send C|END so HandleSession exits ReadConfigFromPipe
+        PipeSendLine("C|END");
+    }
+    std::wcout << L"[OK] Connected" << std::endl;
+
+    // Wait for D| (end of initial browse or skip)
+    std::wcout << L"[INFO] Waiting for browse to complete..." << std::endl;
+    PipeReadUntilDone(300000);
+
+    // Send query command (convert wide path to UTF-8)
+    char queryA[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, queryPath.c_str(), -1, queryA, sizeof(queryA), NULL, NULL);
+    PipeSendLine(std::string("Q|") + queryA);
+    std::wcout << L"[INFO] Query sent: " << queryPath << std::endl;
+
+    // Read response until D|
+    std::string resultLine;
+    PipeReadUntilDone(60000, &resultLine);
+
+    // Send STOP and close
+    PipeSendStop();
+    PipeClose();
+
+    // Print result
+    if (resultLine.empty())
+    {
+        std::wcerr << L"[FAIL] No R| response received" << std::endl;
+        return 1;
+    }
+
+    std::wcout << std::endl << L"--- Query Result ---" << std::endl;
+    // resultLine is R|FOUND|classname|deviceName|ip|slot or R|NOTFOUND|path
+    if (resultLine.length() > 2 && resultLine.substr(2, 5) == "FOUND")
+    {
+        // Parse R|FOUND|classname|deviceName|ip|slot
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, resultLine.c_str(), -1, NULL, 0);
+        if (wlen > 0)
+        {
+            std::wstring wline(wlen - 1, 0);
+            MultiByteToWideChar(CP_UTF8, 0, resultLine.c_str(), -1, &wline[0], wlen);
+            std::wcout << L"[FOUND] " << wline.substr(2) << std::endl;
+        }
+        return 0;
+    }
+    else
+    {
+        std::wcout << L"[NOTFOUND] " << queryPath << std::endl;
+        return 1;
+    }
+}
+
 int wmain(int argc, wchar_t* argv[])
 {
     SetConsoleOutputCP(CP_UTF8);
@@ -1087,6 +1176,7 @@ int wmain(int argc, wchar_t* argv[])
     std::wstring logDir = L"C:\\temp";
     bool debugXml = false;
     bool probeDispids = false;
+    std::wstring queryPath;
 
     // Parse arguments — --driver pushes a new entry, --ip appends to the last driver
     int posArg = 0;
@@ -1095,6 +1185,10 @@ int wmain(int argc, wchar_t* argv[])
         if (_wcsicmp(argv[i], L"--inject") == 0 || _wcsicmp(argv[i], L"-inject") == 0)
         {
             // Accepted for backwards compat, inject is now the default
+        }
+        else if ((_wcsicmp(argv[i], L"--query") == 0 || _wcsicmp(argv[i], L"-query") == 0) && i + 1 < argc)
+        {
+            queryPath = argv[++i];
         }
         else if (_wcsicmp(argv[i], L"--monitor") == 0 || _wcsicmp(argv[i], L"-monitor") == 0)
         {
@@ -1145,6 +1239,9 @@ int wmain(int argc, wchar_t* argv[])
     if (drivers.empty())
         drivers.push_back({L"Test", {}});
 
+    if (!queryPath.empty())
+        return RunQueryMode(queryPath, logDir);
+
     PrintHeader(L"RSLinx Topology Browser - COM Automation");
 
     const wchar_t* modeStr = monitorMode ? L"Monitor (browse existing)" : L"Browse (create/update driver)";
@@ -1164,7 +1261,9 @@ int wmain(int argc, wchar_t* argv[])
     if (probeDispids)
         std::wcout << L"DISPID probing: enabled" << std::endl;
 
-    if (monitorMode)
+    if (!queryPath.empty())
+        return RunQueryMode(queryPath, logDir);
+    else if (monitorMode)
         return RunMonitorMode(drivers, logDir, debugXml, probeDispids);
     else
         return RunInjectMode(drivers, logDir, debugXml, probeDispids);

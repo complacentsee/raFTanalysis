@@ -19,9 +19,8 @@ void PipeSend(const char* data, int len)
     DWORD written;
     if (!WriteFile(g_hPipe, data, len, &written, NULL))
     {
+        // Do NOT close handle — persistent server model; just mark disconnected
         g_pipeConnected = false;
-        CloseHandle(g_hPipe);
-        g_hPipe = INVALID_HANDLE_VALUE;
     }
 }
 
@@ -102,6 +101,72 @@ bool PipeCheckStop()
         }
     }
     return false;
+}
+
+// ============================================================
+// Pipe server functions (hook becomes the named pipe server)
+// ============================================================
+
+bool PipeCreateServer()
+{
+    g_hPipe = CreateNamedPipeW(
+        L"\\\\.\\pipe\\RSLinxHook",
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 4096, 4096, 0, NULL);
+    return g_hPipe != INVALID_HANDLE_VALUE;
+}
+
+bool PipeAcceptClient()
+{
+    if (g_hPipe == INVALID_HANDLE_VALUE) return false;
+    BOOL ok = ConnectNamedPipe(g_hPipe, NULL);
+    if (!ok && GetLastError() == ERROR_PIPE_CONNECTED)
+        ok = TRUE;
+    if (ok) g_pipeConnected = true;
+    return ok != FALSE;
+}
+
+void PipeDisconnectClient()
+{
+    DisconnectNamedPipe(g_hPipe);
+    g_pipeConnected = false;
+}
+
+void PipeDestroyServer()
+{
+    if (g_hPipe != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_hPipe);
+        g_hPipe = INVALID_HANDLE_VALUE;
+    }
+}
+
+// Read one newline-terminated line. Returns false on disconnect or g_shouldStop.
+bool PipeReadLine(char* buf, int maxLen)
+{
+    if (!g_pipeConnected || g_hPipe == INVALID_HANDLE_VALUE) return false;
+    int i = 0;
+    while (i < maxLen - 1 && !g_shouldStop)
+    {
+        DWORD bytesRead = 0;
+        if (!ReadFile(g_hPipe, buf + i, 1, &bytesRead, NULL) || bytesRead == 0)
+        {
+            g_pipeConnected = false;
+            buf[i] = '\0';
+            return false;
+        }
+        if (buf[i] == '\n') { buf[i] = '\0'; return true; }
+        if (buf[i] != '\r') i++;  // skip \r if present
+    }
+    buf[i] = '\0';
+    return false;
+}
+
+void PipeSendLine(const char* line)
+{
+    PipeSend(line, (int)strlen(line));
+    PipeSend("\n", 1);
 }
 
 std::wstring LogPath(const std::wstring& logDir, const wchar_t* filename)

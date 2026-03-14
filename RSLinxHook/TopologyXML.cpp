@@ -1,11 +1,30 @@
 #include "TopologyXML.h"
 #include "Logging.h"
 
+// Extract attribute value from position in buf: attr="value" → value into out[outMax]
+static bool ExtractAttr(const char* pos, const char* attrName, char* out, int outMax)
+{
+    // Build search: " attrName=\""
+    char needle[128];
+    snprintf(needle, sizeof(needle), " %s=\"", attrName);
+    const char* found = strstr(pos, needle);
+    if (!found || found > pos + 400) return false;
+    found += strlen(needle);
+    const char* end = strchr(found, '"');
+    if (!end) return false;
+    int len = (int)(end - found);
+    if (len >= outMax) len = outMax - 1;
+    memcpy(out, found, len);
+    out[len] = '\0';
+    return true;
+}
+
 // ============================================================
 // TopologyXML globals
 // ============================================================
 
 std::map<std::wstring, DeviceInfo> g_deviceDetails;
+std::map<std::wstring, QueryResult> g_queryCache;
 
 // ============================================================
 // TopologyXML implementations
@@ -117,6 +136,206 @@ bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wst
         }
     }
     return false;
+}
+
+// Query topology XML for a device at an IP/port/slot path
+QueryResult QueryXMLForPath(const wchar_t* xmlFile,
+                             const std::wstring& ip,
+                             const std::wstring& portName,
+                             int slot)
+{
+    QueryResult result;
+    result.ip = ip;
+    result.portName = portName;
+    result.slot = slot;
+
+    FILE* f = _wfopen(xmlFile, L"r");
+    if (!f) return result;
+
+    static char buf[262144];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    // Convert ip to narrow
+    char ipA[64];
+    WideCharToMultiByte(CP_ACP, 0, ip.c_str(), -1, ipA, sizeof(ipA), NULL, NULL);
+
+    // Find <address type="String" value="IP">
+    char addrPattern[128];
+    snprintf(addrPattern, sizeof(addrPattern), "value=\"%s\"", ipA);
+    char* pos1 = strstr(buf, addrPattern);
+    if (!pos1) return result;
+
+    if (portName.empty())
+    {
+        // IP-only query: find first <device> after the address element
+        char* devPos = strstr(pos1, "<device ");
+        if (!devPos || devPos > pos1 + 500) return result;
+        // Skip <device reference="..."> entries
+        if (strncmp(devPos + 8, "reference", 9) == 0) {
+            devPos = strstr(devPos + 1, "<device ");
+            if (!devPos || devPos > pos1 + 800) return result;
+        }
+
+        char cn[256] = {}, nm[256] = {};
+        ExtractAttr(devPos, "classname", cn, sizeof(cn));
+        ExtractAttr(devPos, "name", nm, sizeof(nm));
+
+        result.found = true;
+        result.classname = std::wstring(cn, cn + strlen(cn));
+        result.deviceName = std::wstring(nm, nm + strlen(nm));
+        return result;
+    }
+
+    // portName + slot query: find name="portName" then value="slot" then <device>
+    char portA[128];
+    WideCharToMultiByte(CP_ACP, 0, portName.c_str(), -1, portA, sizeof(portA), NULL, NULL);
+
+    char portPattern[256];
+    snprintf(portPattern, sizeof(portPattern), "name=\"%s\"", portA);
+    char* pos2 = strstr(pos1, portPattern);
+    if (!pos2) return result;
+
+    char slotPattern[64];
+    snprintf(slotPattern, sizeof(slotPattern), "value=\"%d\"", slot);
+    char* pos3 = strstr(pos2, slotPattern);
+    if (!pos3) return result;
+
+    // Find <device> within 300 bytes of slot address element
+    char* pos4 = strstr(pos3, "<device ");
+    if (!pos4 || pos4 > pos3 + 300) return result;
+    if (strncmp(pos4 + 8, "reference", 9) == 0)
+    {
+        pos4 = strstr(pos4 + 1, "<device ");
+        if (!pos4 || pos4 > pos3 + 500) return result;
+    }
+
+    char cn[256] = {}, nm[256] = {};
+    ExtractAttr(pos4, "classname", cn, sizeof(cn));
+    ExtractAttr(pos4, "name", nm, sizeof(nm));
+
+    result.found = true;
+    result.classname = std::wstring(cn, cn + strlen(cn));
+    result.deviceName = std::wstring(nm, nm + strlen(nm));
+    return result;
+}
+
+// Populate g_queryCache from topology XML — called once after each browse phase.
+// Walks every <address type="String" value="IP"> block and extracts:
+//   "ip"              -> top-level device (classname, name)
+//   "ip\Port\slot"    -> per-slot device on any named backplane-style bus
+void PopulateQueryCache(const wchar_t* xmlFile)
+{
+    FILE* f = _wfopen(xmlFile, L"r");
+    if (!f) return;
+    static char buf[262144];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    char* p = buf;
+    while ((p = strstr(p, "<address type=\"String\" value=\"")) != nullptr)
+    {
+        p += 30; // skip to start of IP value
+        char* ipEnd = strchr(p, '"');
+        if (!ipEnd) break;
+        std::string ipA(p, ipEnd);
+        std::wstring ipW(ipA.begin(), ipA.end());
+        p = ipEnd;
+
+        // Find top-level <device> for this IP (within 500 bytes)
+        char* searchEnd = p + 500;
+        if (searchEnd > buf + n) searchEnd = buf + n;
+        char* devPos = strstr(p, "<device ");
+        if (!devPos || devPos >= searchEnd) continue;
+        if (strncmp(devPos + 8, "reference", 9) == 0) {
+            devPos = strstr(devPos + 1, "<device ");
+            if (!devPos || devPos >= searchEnd) continue;
+        }
+
+        char cn[256] = {}, nm[256] = {};
+        ExtractAttr(devPos, "classname", cn, sizeof(cn));
+        ExtractAttr(devPos, "name", nm, sizeof(nm));
+
+        // Store IP-only entry
+        QueryResult ipResult;
+        ipResult.found = true;
+        ipResult.ip = ipW;
+        ipResult.classname = std::wstring(cn, cn + strlen(cn));
+        ipResult.deviceName = std::wstring(nm, nm + strlen(nm));
+        ipResult.slot = -1;
+        g_queryCache[ipW] = ipResult;
+
+        // Walk into ports → buses → slots
+        // Find all <port name="..."> within the next 8KB of this device block
+        char* portSearch = devPos;
+        char* portEnd = devPos + 8192;
+        if (portEnd > buf + n) portEnd = buf + n;
+
+        while (portSearch < portEnd)
+        {
+            char* portPos = strstr(portSearch, "<port ");
+            if (!portPos || portPos >= portEnd) break;
+
+            char portName[128] = {};
+            ExtractAttr(portPos, "name", portName, sizeof(portName));
+            std::wstring portNameW(portName, portName + strlen(portName));
+
+            // Find <bus> within the next 200 bytes of this port
+            char* busPos = strstr(portPos, "<bus ");
+            if (!busPos || busPos > portPos + 200) { portSearch = portPos + 1; continue; }
+
+            // Enumerate <address type="Short" value="N"> within the bus block (next 4KB)
+            char* slotSearch = busPos;
+            char* slotEnd = busPos + 4096;
+            if (slotEnd > buf + n) slotEnd = buf + n;
+
+            while (slotSearch < slotEnd)
+            {
+                char* slotPos = strstr(slotSearch, "<address type=\"Short\" value=\"");
+                if (!slotPos || slotPos >= slotEnd) break;
+
+                char slotStr[16] = {};
+                // value is right after 'value="'
+                char* sv = slotPos + 29; // skip '<address type="Short" value="' (29 chars)
+                char* svEnd = strchr(sv, '"');
+                if (!svEnd) { slotSearch = slotPos + 1; continue; }
+                int slotLen = (int)(svEnd - sv < 15 ? svEnd - sv : 15);
+                memcpy(slotStr, sv, slotLen);
+                int slotN = atoi(slotStr);
+
+                // Find <device> within 200 bytes of this slot address
+                char* slotDevPos = strstr(slotPos, "<device ");
+                if (!slotDevPos || slotDevPos > slotPos + 200) { slotSearch = slotPos + 1; continue; }
+                if (strncmp(slotDevPos + 8, "reference", 9) == 0) {
+                    slotDevPos = strstr(slotDevPos + 1, "<device ");
+                    if (!slotDevPos || slotDevPos > slotPos + 300) { slotSearch = slotPos + 1; continue; }
+                }
+
+                char scn[256] = {}, snm[256] = {};
+                ExtractAttr(slotDevPos, "classname", scn, sizeof(scn));
+                ExtractAttr(slotDevPos, "name", snm, sizeof(snm));
+
+                // Build cache key: "ip\portName\slot"
+                wchar_t slotKeyBuf[512];
+                swprintf(slotKeyBuf, 512, L"%s\\%s\\%d", ipW.c_str(), portNameW.c_str(), slotN);
+
+                QueryResult slotResult;
+                slotResult.found = true;
+                slotResult.ip = ipW;
+                slotResult.portName = portNameW;
+                slotResult.slot = slotN;
+                slotResult.classname = std::wstring(scn, scn + strlen(scn));
+                slotResult.deviceName = std::wstring(snm, snm + strlen(snm));
+                g_queryCache[slotKeyBuf] = slotResult;
+
+                slotSearch = slotDevPos + 1;
+            }
+
+            portSearch = portPos + 1;
+        }
+    }
 }
 
 // Update g_deviceDetails with IP addresses extracted from topology XML

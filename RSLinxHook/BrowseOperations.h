@@ -16,6 +16,10 @@ extern std::vector<EnumeratorInfo> g_enumerators;
 extern DualEventSink* g_pMainSink;
 extern IUnknown* g_pMainEnumUnk;
 
+// Browse-state tracking: which driver names / IPs have completed each phase
+extern std::set<std::wstring> g_browsedDrivers;    // driver names with Phase 2+3 complete
+extern std::set<std::wstring> g_browsedBackplanes; // IPs with Phase 4+4b complete
+
 bool EnumeratorsCycledSince(int baseline);
 void GetEnumeratorStatusSince(int baseline, int& completed, int& total);
 

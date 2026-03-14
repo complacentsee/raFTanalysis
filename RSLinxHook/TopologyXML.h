@@ -20,7 +20,26 @@ struct DeviceInfo {
 
 extern std::map<std::wstring, DeviceInfo> g_deviceDetails;
 
+// Path query result: ip-only (portName="", slot=-1) or backplane slot
+struct QueryResult {
+    bool found = false;
+    std::wstring classname;
+    std::wstring deviceName;
+    std::wstring ip;
+    std::wstring portName;
+    int slot = -1;
+};
+
+// In-memory query cache: key = "ip" or "ip\PortName\slot"
+// Populated once after each browse phase; queried without any file I/O.
+extern std::map<std::wstring, QueryResult> g_queryCache;
+
 bool SaveTopologyXML(IRSTopologyGlobals* pGlobals, const wchar_t* filename);
 TopologyCounts CountDevicesInXML(const wchar_t* filename);
 bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs);
 void UpdateDeviceIPsFromXML(const wchar_t* filename);
+void PopulateQueryCache(const wchar_t* xmlFile);
+QueryResult QueryXMLForPath(const wchar_t* xmlFile,
+                             const std::wstring& ip,
+                             const std::wstring& portName,
+                             int slot);
