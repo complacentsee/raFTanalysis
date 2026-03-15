@@ -430,17 +430,36 @@ void WalkTopologyTree(IRSTopologyGlobals* pGlobals)
     out.push_back("N|BEGIN\n");
     out.push_back(WalkNodeLine("N|ROOT", L"WORKSTATION", L"Workstation"));
 
+    // Dedup by network address (IP, or devName when IP is unknown) so that
+    // two driver configs pointing at the same device don't emit it twice.
+    std::set<std::wstring> emittedAddrs;
+
     for (const auto& drv : g_pSharedConfig->drivers)
     {
-        out.push_back(WalkNodeLine("N|BUS", drv.name, L""));
-
         auto dit = g_driverDeviceNames.find(drv.name);
-        if (dit == g_driverDeviceNames.end()) continue;
+        if (dit == g_driverDeviceNames.end() || dit->second.empty()) continue;
 
+        // Pre-scan: collect devices not yet emitted for this driver.
+        // Skip the bus entirely if there is nothing new to show.
+        std::vector<std::wstring> newDevices;
         for (const auto& devName : dit->second)
         {
             if (devName.empty()) continue;
+            std::wstring ip;
+            {
+                auto it = g_deviceDetails.find(devName);
+                if (it != g_deviceDetails.end()) ip = it->second.ip;
+            }
+            std::wstring addrVal = ip.empty() ? devName : ip;
+            if (emittedAddrs.count(addrVal) == 0)
+                newDevices.push_back(devName);
+        }
+        if (newDevices.empty()) continue;
 
+        out.push_back(WalkNodeLine("N|BUS", drv.name, L""));
+
+        for (const auto& devName : newDevices)
+        {
             // IP from g_deviceDetails
             std::wstring ip;
             {
@@ -459,6 +478,7 @@ void WalkTopologyTree(IRSTopologyGlobals* pGlobals)
             }
 
             std::wstring addrVal = ip.empty() ? devName : ip;
+            emittedAddrs.insert(addrVal);
             out.push_back(WalkAddrLine("String", addrVal, devName, classname));
 
             if (ip.empty()) continue;

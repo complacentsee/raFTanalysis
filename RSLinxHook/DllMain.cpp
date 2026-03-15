@@ -889,7 +889,7 @@ static void HandleSession(HookConfig& config, IRSTopologyGlobals* pGlobals,
         bool found = false;
         for (auto& existDrv : config.drivers)
         {
-            if (existDrv.name == newDrv.name)
+            if (_wcsicmp(existDrv.name.c_str(), newDrv.name.c_str()) == 0)
             {
                 for (auto& ip : newDrv.ipAddresses)
                 {
@@ -924,6 +924,11 @@ static void HandleSession(HookConfig& config, IRSTopologyGlobals* pGlobals,
     bool shouldBrowse = buses.empty() ? false : (hasNewWork || g_browsedDrivers.empty());
     if (shouldBrowse)
     {
+        // Always unadvise stale sinks before registering new ones.
+        // Handles the case where the hook is reused across viewer sessions
+        // without being unloaded — old CPs would otherwise accumulate and
+        // fire every event twice (or more).
+        ExecuteOnMainSTA(DoCleanupOnMainSTA);
         RunBrowsePhases(config, pGlobals, buses);
     }
     else
@@ -963,6 +968,7 @@ static void HandleSession(HookConfig& config, IRSTopologyGlobals* pGlobals,
         else if (strcmp(line, "B|") == 0)
         {
             Log(L"[PIPE] Re-browse requested by client");
+            ExecuteOnMainSTA(DoCleanupOnMainSTA); // unadvise stale sinks before re-registering
             bool ok = SafeRunBrowsePhases(config, pGlobals, buses);
             PipeSend("D|\n", 3);
             if (!ok) break; // COM state likely corrupt — disconnect client

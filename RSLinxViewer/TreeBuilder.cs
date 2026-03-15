@@ -56,7 +56,11 @@ static class TreeBuilder
                     FlushSlotLeaves(slotLeaves, current);
                     string name = parts[2];
                     string cls  = parts[3];
-                    var busNode = current.AddNode(FormatBus(name, cls));
+                    // When stack is empty we're at driver level — always attach to root,
+                    // not to the previous driver's bus node (which is what current points
+                    // to after a POP that drains the stack).
+                    IHasTreeNodes parent = stack.Count == 0 ? (IHasTreeNodes)rootTree! : current;
+                    var busNode = parent.AddNode(FormatBus(name, cls));
                     current = busNode;
                     lastDevNode = null;
                     break;

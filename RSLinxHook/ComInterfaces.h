@@ -32,6 +32,7 @@ extern const GUID IID_ITopologyObject;
 extern const GUID IID_IRSTopologyPort;
 extern const GUID IID_IRSObject;
 extern const GUID IID_IRSTopologyOnlineNotify;
+extern const GUID IID_IDeviceEnumNotify;   // {B04746EA} fires BrowseStarted/Ended/Cycled on device enumerators
 
 // ============================================================
 // Interface declarations (minimal)

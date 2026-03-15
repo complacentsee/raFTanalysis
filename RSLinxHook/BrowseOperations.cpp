@@ -271,6 +271,18 @@ HRESULT DoBusBrowse()
                     int cpIdx = 0;
                     while (pEnumCP->Next(1, &pCP, &fetched) == S_OK && fetched > 0)
                     {
+                        // Only register for IID_IDeviceEnumNotify ({B04746EA}).
+                        // Empirically confirmed as the sole CP that fires BrowseStarted,
+                        // BrowseEnded, and BrowseCycled. The other CP ({A3B4C4D4}) fires
+                        // nothing observable and causes a spurious duplicate BrowseEnded.
+                        IID cpIID = IID_NULL;
+                        pCP->GetConnectionInterface(&cpIID);
+                        if (!IsEqualIID(cpIID, IID_IDeviceEnumNotify))
+                        {
+                            pCP->Release();
+                            cpIdx++;
+                            continue;
+                        }
                         DWORD c = 0;
                         HRESULT hrAdv = pCP->Advise(static_cast<IRSTopologyOnlineNotify*>(pSink), &c);
                         if (SUCCEEDED(hrAdv))
@@ -833,17 +845,35 @@ HRESULT DoMainSTABrowse()
                 IConnectionPoint* pCP = nullptr;
                 ULONG fetched = 0;
                 int cpIdx = 0;
+                int cpConnected = 0;
                 while (pEnumCPEnum->Next(1, &pCP, &fetched) == S_OK && fetched > 0)
                 {
+                    // Only register for the primary online-notify interface.
+                    // Bus events are handled via the explicit bus CP above.
+                    // Unknown IIDs: our sink returns the notify vtable for any QI,
+                    // so Advise would succeed, but RSLinx would then call through an
+                    // incompatible vtable layout causing spurious/corrupt callbacks
+                    // (e.g. pBus=0x00000002). Whitelist-only prevents duplicates.
+                    IID cpIID = IID_NULL;
+                    pCP->GetConnectionInterface(&cpIID);
+                    if (!IsEqualIID(cpIID, IID_IRSTopologyOnlineNotify))
+                    {
+                        pCP->Release();
+                        cpIdx++;
+                        continue;
+                    }
                     DWORD enumCookie = 0;
                     hr = pCP->Advise(static_cast<IRSTopologyOnlineNotify*>(pSink), &enumCookie);
                     if (SUCCEEDED(hr))
+                    {
                         g_connectionPoints.push_back({pCP, enumCookie});
+                        cpConnected++;
+                    }
                     else
                         pCP->Release();
                     cpIdx++;
                 }
-                Log(L"[MAIN-STA] Connected %d enumerator CPs", cpIdx);
+                Log(L"[MAIN-STA] Connected %d enumerator CPs (%d registered)", cpIdx, cpConnected);
                 pSink->DumpDWords(L"after-enum-advise");
                 pSink->CheckCanaries(L"after-enum-advise");
                 pEnumCPEnum->Release();
