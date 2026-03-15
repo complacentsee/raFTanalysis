@@ -22,6 +22,11 @@ static class TopologyParser
         {
             var doc = XDocument.Parse(xml);
 
+            // Build objectid → element lookup so reference devices can be resolved.
+            var refLookup = doc.Descendants("device")
+                .Where(d => d.Attribute("objectid") != null)
+                .ToDictionary(d => d.Attribute("objectid")!.Value, d => d);
+
             var treeEl = doc.Root?.Element("tree");
             if (treeEl == null)
                 return null;
@@ -37,7 +42,7 @@ static class TopologyParser
 
             foreach (var port in rootDevice.Elements("port"))
             {
-                ProcessPort(port, tree);
+                ProcessPort(port, tree, refLookup);
             }
 
             return tree;
@@ -59,13 +64,23 @@ static class TopologyParser
         try
         {
             var doc = XDocument.Parse(xml);
+
+            // Build lookup so reference devices can be resolved for counting.
+            var refLookup = doc.Descendants("device")
+                .Where(d => d.Attribute("objectid") != null)
+                .ToDictionary(d => d.Attribute("objectid")!.Value, d => d);
+
             int total = 0, identified = 0;
             foreach (var dev in doc.Descendants("device"))
             {
-                // Skip references
-                if (dev.Attribute("reference") != null)
+                // Resolve references; skip if unresolvable.
+                var effective = dev.Attribute("reference") != null
+                    ? ResolveRef(dev, refLookup)
+                    : dev;
+                if (effective == null)
                     continue;
-                string? cn = dev.Attribute("classname")?.Value;
+
+                string? cn = effective.Attribute("classname")?.Value;
                 if (cn == null)
                     continue;
                 total++;
@@ -80,16 +95,16 @@ static class TopologyParser
         }
     }
 
-    static void ProcessPort(XElement port, IHasTreeNodes parent)
+    static void ProcessPort(XElement port, IHasTreeNodes parent, Dictionary<string, XElement> refLookup)
     {
         // A port typically leads to a bus. Show the bus, not the port itself.
         foreach (var bus in port.Elements("bus"))
         {
-            ProcessBus(bus, parent);
+            ProcessBus(bus, parent, refLookup);
         }
     }
 
-    static void ProcessBus(XElement bus, IHasTreeNodes parent)
+    static void ProcessBus(XElement bus, IHasTreeNodes parent, Dictionary<string, XElement> refLookup)
     {
         string busName = bus.Attribute("name")?.Value ?? "Bus";
         string busClass = bus.Attribute("classname")?.Value ?? "";
@@ -104,12 +119,18 @@ static class TopologyParser
             if (addrType == "Empty") continue;
 
             var device = addr.Element("device");
-            if (device == null || device.Attribute("reference") != null) continue;
+            if (device == null) continue;
+
+            // Resolve reference devices instead of skipping them.
+            bool isRef = device.Attribute("reference") != null;
+            if (isRef)
+                device = ResolveRef(device, refLookup);
+            if (device == null) continue;
 
             string? devName = device.Attribute("name")?.Value;
             if (devName == null) continue;
 
-            // Leaf slot modules: Short address with no sub-ports
+            // Leaf slot modules: Short address with no sub-ports.
             if (addrType == "Short" && !device.Elements("port").Any())
             {
                 slotLeaves.Add((
@@ -127,7 +148,7 @@ static class TopologyParser
 
         // Non-leaf / non-slot devices render as normal tree nodes
         foreach (var addr in otherAddresses)
-            ProcessAddress(addr, busNode);
+            ProcessAddress(addr, busNode, refLookup);
 
         // Leaf slot modules render in a compact 2-column grid
         if (slotLeaves.Count > 0)
@@ -156,7 +177,7 @@ static class TopologyParser
         }
     }
 
-    static void ProcessAddress(XElement addr, TreeNode parent)
+    static void ProcessAddress(XElement addr, TreeNode parent, Dictionary<string, XElement> refLookup)
     {
         string addrType = addr.Attribute("type")?.Value ?? "";
         string addrValue = addr.Attribute("value")?.Value ?? "";
@@ -169,8 +190,12 @@ static class TopologyParser
         if (device == null)
             return;
 
-        // Skip back-references
-        if (device.Attribute("reference") != null)
+        // Resolve back-references instead of skipping them.
+        // Resolved references are rendered as leaves (no port recursion) to avoid loops.
+        bool isRef = device.Attribute("reference") != null;
+        if (isRef)
+            device = ResolveRef(device, refLookup);
+        if (device == null)
             return;
 
         string? devName = device.Attribute("name")?.Value;
@@ -198,14 +223,29 @@ static class TopologyParser
 
         var devNode = parent.AddNode(label);
 
+        // Do not recurse into resolved reference devices — that would loop back to the same device.
+        if (isRef)
+            return;
+
         // Recurse into device's ports → buses → addresses
         foreach (var port in device.Elements("port"))
         {
             foreach (var childBus in port.Elements("bus"))
             {
-                ProcessBus(childBus, devNode);
+                ProcessBus(childBus, devNode, refLookup);
             }
         }
+    }
+
+    /// <summary>
+    /// Resolves a reference device element to its canonical definition via objectid lookup.
+    /// Returns null if the reference GUID is missing or not found in the lookup.
+    /// </summary>
+    static XElement? ResolveRef(XElement refDevice, Dictionary<string, XElement> lookup)
+    {
+        var guid = refDevice.Attribute("reference")?.Value;
+        if (guid == null) return null;
+        return lookup.TryGetValue(guid, out var actual) ? actual : null;
     }
 
     static string FormatDeviceName(string name, string? classname)
