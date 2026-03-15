@@ -635,12 +635,15 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
     {
         std::wstring afterPath = LogPath(config.logDir, config.debugXml ? L"hook_topo_after.xml" : L"hook_topo_poll.xml");
         SaveTopologyXML(pGlobals, afterPath.c_str());
-        PipeSendTopology(afterPath.c_str());
 
         TopologyCounts fc = CountDevicesInXML(afterPath.c_str());
-        PipeSendStatus(fc.totalDevices, fc.identifiedDevices, (int)g_discoveredDevices.size());
+        // Populate caches before tree walk so WalkTopologyTree has fresh IP/classname/slot data
         UpdateDeviceIPsFromXML(afterPath.c_str());
         PopulateQueryCache(afterPath.c_str());
+        WalkTopologyTree(pGlobals);
+        if (config.debugXml)
+            PipeSendTopology(afterPath.c_str());
+        PipeSendStatus(fc.totalDevices, fc.identifiedDevices, (int)g_discoveredDevices.size());
         std::vector<std::wstring> allIPs = config.allIPs();
         bool targetFound = !allIPs.empty() && IsTargetIdentifiedInXML(afterPath.c_str(), allIPs);
         Log(L"Final topology: %d devices, %d identified",
@@ -931,7 +934,9 @@ static void HandleSession(HookConfig& config, IRSTopologyGlobals* pGlobals,
         if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
         {
             TopologyCounts cached = CountDevicesInXML(pollFile.c_str());
-            PipeSendTopology(pollFile.c_str());
+            WalkTopologyTree(pGlobals);
+            if (config.debugXml)
+                PipeSendTopology(pollFile.c_str());
             PipeSendStatus(cached.totalDevices, cached.identifiedDevices, (int)g_discoveredDevices.size());
             Log(L"[INFO] Replayed cached topology: %d devices, %d identified",
                 cached.totalDevices, cached.identifiedDevices);

@@ -1,5 +1,7 @@
 #include "TopologyXML.h"
 #include "Logging.h"
+#include "DispatchHelpers.h"
+#include "STAHook.h"
 
 // Extract attribute value from position in buf: attr="value" → value into out[outMax]
 static bool ExtractAttr(const char* pos, const char* attrName, char* out, int outMax)
@@ -58,6 +60,7 @@ static bool ResolveReference(const char* buf, const char* refDevPos,
 
 std::map<std::wstring, DeviceInfo> g_deviceDetails;
 std::map<std::wstring, QueryResult> g_queryCache;
+std::map<std::wstring, std::vector<std::wstring>> g_driverDeviceNames;
 
 // ============================================================
 // TopologyXML implementations
@@ -372,6 +375,137 @@ void PopulateQueryCache(const wchar_t* xmlFile)
             portSearch = portPos + 1;
         }
     }
+}
+
+// ============================================================
+// WalkTopologyTree — emit N| topology block from cache + COM globals
+// ============================================================
+
+// Convert wide string to UTF-8, replacing pipe/newline chars with spaces.
+static std::string WalkWideToUtf8(const std::wstring& w)
+{
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                        &s[0], n, nullptr, nullptr);
+    for (char& c : s)
+        if (c == '|' || c == '\n' || c == '\r') c = ' ';
+    return s;
+}
+
+// Format: N|TYPE|field1|field2\n
+static std::string WalkNodeLine(const char* msgType,
+                                 const std::wstring& f1,
+                                 const std::wstring& f2)
+{
+    return std::string(msgType) + "|" +
+           WalkWideToUtf8(f1) + "|" +
+           WalkWideToUtf8(f2) + "\n";
+}
+
+// Format: N|ADDR|addrType|addrVal|devName|classname\n
+static std::string WalkAddrLine(const char* addrType,
+                                 const std::wstring& addrVal,
+                                 const std::wstring& devName,
+                                 const std::wstring& classname)
+{
+    return std::string("N|ADDR|") + addrType + "|" +
+           WalkWideToUtf8(addrVal) + "|" +
+           WalkWideToUtf8(devName) + "|" +
+           WalkWideToUtf8(classname) + "\n";
+}
+
+// Emit N|BEGIN...N|END block using g_driverDeviceNames (set by DoBusBrowse),
+// g_deviceDetails (set by UpdateDeviceIPsFromXML), and g_queryCache (set by PopulateQueryCache).
+// No COM calls made here — all data comes from in-memory caches.
+// pGlobals is accepted for API consistency and null-guard only.
+void WalkTopologyTree(IRSTopologyGlobals* pGlobals)
+{
+    if (!g_pipeConnected || !pGlobals || !g_pSharedConfig) return;
+
+    std::vector<std::string> out;
+    out.reserve(64);
+    out.push_back("N|BEGIN\n");
+    out.push_back(WalkNodeLine("N|ROOT", L"WORKSTATION", L"Workstation"));
+
+    for (const auto& drv : g_pSharedConfig->drivers)
+    {
+        out.push_back(WalkNodeLine("N|BUS", drv.name, L""));
+
+        auto dit = g_driverDeviceNames.find(drv.name);
+        if (dit == g_driverDeviceNames.end()) continue;
+
+        for (const auto& devName : dit->second)
+        {
+            if (devName.empty()) continue;
+
+            // IP from g_deviceDetails
+            std::wstring ip;
+            {
+                auto it = g_deviceDetails.find(devName);
+                if (it != g_deviceDetails.end())
+                    ip = it->second.ip;
+            }
+
+            // Classname from g_queryCache (keyed by IP)
+            std::wstring classname;
+            if (!ip.empty())
+            {
+                auto it = g_queryCache.find(ip);
+                if (it != g_queryCache.end())
+                    classname = it->second.classname;
+            }
+
+            std::wstring addrVal = ip.empty() ? devName : ip;
+            out.push_back(WalkAddrLine("String", addrVal, devName, classname));
+
+            if (ip.empty()) continue;
+
+            // Find backplane slot entries: g_queryCache keys "ip\portName\slot"
+            std::map<std::wstring, std::map<int, QueryResult>> ports;
+            for (const auto& kv : g_queryCache)
+            {
+                const std::wstring& key = kv.first;
+                if (key.size() <= ip.size() + 1) continue;
+                if (key.compare(0, ip.size(), ip) != 0) continue;
+                if (key[ip.size()] != L'\\') continue;
+                size_t portEnd = key.find(L'\\', ip.size() + 1);
+                if (portEnd == std::wstring::npos) continue;
+                std::wstring portName = key.substr(ip.size() + 1, portEnd - ip.size() - 1);
+                if (!portName.empty() && kv.second.slot >= 0)
+                    ports[portName][kv.second.slot] = kv.second;
+            }
+
+            if (!ports.empty())
+            {
+                out.push_back("N|PUSH\n");
+                for (const auto& portKv : ports)
+                {
+                    out.push_back(WalkNodeLine("N|BUS", portKv.first, L""));
+                    for (const auto& slotKv : portKv.second)
+                    {
+                        const QueryResult& qr = slotKv.second;
+                        out.push_back(WalkAddrLine("Short",
+                            std::to_wstring(slotKv.first),
+                            qr.deviceName,
+                            qr.classname));
+                    }
+                }
+                out.push_back("N|POP\n");
+            }
+        }
+    }
+
+    out.push_back("N|END\n");
+
+    EnterCriticalSection(&g_logCS);
+    for (const auto& line : out)
+        PipeSend(line.c_str(), (int)line.size());
+    LeaveCriticalSection(&g_logCS);
+
+    Log(L"[WALK] N| block sent: %d lines", (int)out.size());
 }
 
 // Update g_deviceDetails with IP addresses extracted from topology XML

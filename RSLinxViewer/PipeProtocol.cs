@@ -30,6 +30,7 @@ sealed class PipeClient : IDisposable
 
     readonly List<string> _logLines = new(MaxLogLines);
     string? _latestXml;
+    List<string>? _latestNodeBlock;
     int _totalDevices;
     int _identifiedDevices;
     int _eventCount;
@@ -121,6 +122,8 @@ sealed class PipeClient : IDisposable
             using var reader = new StreamReader(_pipe, Encoding.UTF8, leaveOpen: true);
             var xmlBuilder = new StringBuilder();
             bool inXmlBlock = false;
+            var nodeLines = new List<string>();
+            bool inNodeBlock = false;
 
             while (!ct.IsCancellationRequested)
             {
@@ -158,6 +161,23 @@ sealed class PipeClient : IDisposable
                     continue;
                 }
 
+                if (inNodeBlock)
+                {
+                    if (line == "N|END")
+                    {
+                        inNodeBlock = false;
+                        lock (_lock)
+                        {
+                            _latestNodeBlock = new List<string>(nodeLines);
+                        }
+                    }
+                    else
+                    {
+                        nodeLines.Add(line);
+                    }
+                    continue;
+                }
+
                 if (line.StartsWith("L|"))
                 {
                     string msg = line[2..];
@@ -186,6 +206,11 @@ sealed class PipeClient : IDisposable
                     inXmlBlock = true;
                     xmlBuilder.Clear();
                 }
+                else if (line == "N|BEGIN")
+                {
+                    inNodeBlock = true;
+                    nodeLines.Clear();
+                }
                 else if (line.StartsWith("D|"))
                 {
                     lock (_lock) { _done = true; }
@@ -213,6 +238,15 @@ sealed class PipeClient : IDisposable
         lock (_lock)
         {
             return _latestXml;
+        }
+    }
+
+    /// <summary>Get the latest node block lines (N| messages between N|BEGIN and N|END), or null if none received yet.</summary>
+    public List<string>? GetLatestNodeBlock()
+    {
+        lock (_lock)
+        {
+            return _latestNodeBlock;
         }
     }
 

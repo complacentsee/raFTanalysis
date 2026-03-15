@@ -43,3 +43,11 @@ QueryResult QueryXMLForPath(const wchar_t* xmlFile,
                              const std::wstring& ip,
                              const std::wstring& portName,
                              int slot);
+
+// N| topology pipe: ordered Ethernet device names per driver (populated by DoBusBrowse).
+// Used by WalkTopologyTree so no COM calls are needed from the worker thread.
+extern std::map<std::wstring, std::vector<std::wstring>> g_driverDeviceNames;
+
+// Emit the topology as N| messages (N|BEGIN...N|END) on the pipe.
+// Must be called AFTER UpdateDeviceIPsFromXML + PopulateQueryCache for the current snapshot.
+void WalkTopologyTree(IRSTopologyGlobals* pGlobals);

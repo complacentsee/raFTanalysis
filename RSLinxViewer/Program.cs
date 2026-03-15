@@ -174,6 +174,7 @@ class Program
             .StartAsync(async ctx =>
             {
                 string? lastXml = null;
+                List<string>? lastNodeBlock = null;
                 Tree? currentTree = null;
 
                 while (!ct.IsCancellationRequested)
@@ -204,11 +205,18 @@ class Program
                         }
                     }
 
+                    var nodeBlock = pipe.GetLatestNodeBlock();
                     string? xml = pipe.GetLatestXml();
                     var logLines = pipe.GetRecentLog(15);
                     var (total, identified, events) = pipe.GetStatus();
 
-                    if (xml != null && xml != lastXml)
+                    // Prefer N| node block; fall back to X| XML (intermediate polls or debug-xml mode)
+                    if (nodeBlock != null && !ReferenceEquals(nodeBlock, lastNodeBlock))
+                    {
+                        lastNodeBlock = nodeBlock;
+                        currentTree = TreeBuilder.Build(nodeBlock);
+                    }
+                    else if (nodeBlock == null && xml != null && xml != lastXml)
                     {
                         lastXml = xml;
                         currentTree = TopologyParser.BuildTree(xml);
@@ -235,11 +243,14 @@ class Program
                     }
                 }
 
-                // Final render
+                // Final render — prefer latest node block, fall back to XML
+                var finalNodeBlock = pipe.GetLatestNodeBlock();
                 string? finalXml = pipe.GetLatestXml();
                 var finalLog = pipe.GetRecentLog(15);
                 var finalStatus = pipe.GetStatus();
-                Tree? finalTree = finalXml != null ? TopologyParser.BuildTree(finalXml) : currentTree;
+                Tree? finalTree = finalNodeBlock != null
+                    ? TreeBuilder.Build(finalNodeBlock)
+                    : (finalXml != null ? TopologyParser.BuildTree(finalXml) : currentTree);
                 var finalLayout = BuildLayout(finalTree, finalLog, finalStatus.total, finalStatus.identified, finalStatus.events, false, true, 0, out _);
                 ctx.UpdateTarget(finalLayout);
                 ctx.Refresh();

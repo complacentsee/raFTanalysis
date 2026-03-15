@@ -138,6 +138,9 @@ HRESULT DoBusBrowse()
 
     for (auto& drv : g_pSharedConfig->drivers)
     {
+    // Reset device-name list for this driver (fresh browse)
+    g_driverDeviceNames[drv.name].clear();
+
     Log(L"[BUS] === Driver: %s ===", drv.name.c_str());
     IDispatch* pBusDisp = GetBusDispatch(drv.name.c_str());
     if (!pBusDisp)
@@ -179,6 +182,10 @@ HRESULT DoBusBrowse()
             if (!devName.empty())
                 g_deviceDetails[devName] = info;
         }
+
+        // Store device name order for WalkTopologyTree (worker-thread-safe, no COM needed)
+        if (!devName.empty())
+            g_driverDeviceNames[drv.name].push_back(devName);
 
         // Probe DISPIDs if requested (Phase A discovery)
         if (g_pSharedConfig->probeDispids)
@@ -997,7 +1004,6 @@ void RunMonitorLoop(const HookConfig& config, IRSTopologyGlobals* pGlobals, cons
             if (SaveTopologyXML(pGlobals, snapFile.c_str()))
             {
                 TopologyCounts c = CountDevicesInXML(snapFile.c_str());
-                PipeSendTopology(snapFile.c_str());
                 PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
                 Log(L"[MONITOR] Snapshot %d @ %ds: %d devices, %d identified, %d events",
                     snapshotNum, elapsed / 1000, c.totalDevices, c.identifiedDevices,
@@ -1022,7 +1028,12 @@ void RunMonitorLoop(const HookConfig& config, IRSTopologyGlobals* pGlobals, cons
                     backplaneBrowseDone = true;
                 }
 
+                // Update caches before tree walk so WalkTopologyTree has fresh IP/classname data
                 UpdateDeviceIPsFromXML(snapFile.c_str());
+                PopulateQueryCache(snapFile.c_str());
+                WalkTopologyTree(pGlobals);
+                if (config.debugXml)
+                    PipeSendTopology(snapFile.c_str());
 
                 std::wstring resultsPath = LogPath(config.logDir, L"hook_results.txt");
                 FILE* rf = _wfopen(resultsPath.c_str(), L"w, ccs=UTF-8");
