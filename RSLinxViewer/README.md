@@ -27,8 +27,8 @@ RSLinxViewer.exe --driver NAME [IP...] [--driver NAME2 [IP...]] [--dll PATH] [--
 ### Examples
 
 ```bash
-# Browse driver SUFF2 with one IP
-RSLinxViewer.exe --driver SUFF2 10.13.30.68
+# Browse driver Test with one IP
+RSLinxViewer.exe --driver Test --ip 192.168.1.55
 
 # Monitor mode (no driver changes)
 RSLinxViewer.exe --driver SUFF2 --monitor
@@ -57,27 +57,29 @@ RSLinxViewer.exe --driver Test --dll C:\path\to\RSLinxHook.dll
 | Up/Down arrows | Scroll topology tree |
 | PgUp/PgDn | Scroll 10 lines |
 | Home | Scroll to top |
-| Ctrl+C | Stop hook and exit |
+| B | Trigger re-browse (in-band, no reconnect) |
+| Ctrl+C | Send STOP and exit |
 
 ## How It Works
 
-1. **Inject** — Finds RSLinx PID, ejects any old DLL, injects RSLinxHook.dll via `CreateRemoteThread(LoadLibraryW)`
-2. **Pipe** — Creates `\\.\pipe\RSLinxHook` named pipe server, waits for hook to connect
-3. **Config** — Sends driver names, IPs, and mode over the pipe
+1. **Smart injection** — Probes `\\.\pipe\RSLinxHook` (500 ms timeout). If the hook is already running, connects directly without re-injecting. If not found, injects RSLinxHook.dll via `CreateRemoteThread(LoadLibraryW)` and waits up to 10 s for the pipe server to appear.
+2. **Pipe** — Connects to `\\.\pipe\RSLinxHook` as a named pipe **client** (hook is the server)
+3. **Config** — Sends driver names, IPs, and mode over the pipe (`C|MODE`, `C|DRIVER`, `C|IP`, `C|END`)
 4. **Display** — Reads pipe messages in background:
    - `L|` log lines shown in the log panel
    - `S|` status updates shown in the footer
    - `X|BEGIN...X|END` topology XML parsed into a scrollable tree
-   - `D|` signals completion
-5. **Cleanup** — Sends `STOP` over pipe, waits for hook to finish, ejects DLL
+   - `D|` signals browse complete; pipe stays open for re-browse and queries
+5. **Re-browse** — Pressing `B` sends `B|` over the existing connection; hook re-runs all browse phases in-place and sends a new `X|BEGIN...X|END` block followed by `D|`. No disconnect/reconnect.
+6. **Cleanup** — Ctrl+C sends `STOP` over pipe and closes the handle. The hook remains injected and loops back to accept the next client.
 
 ## Architecture
 
 ```
 RSLinxViewer/
 ├── Program.cs          — CLI parsing, DLL injection, TUI live display loop
-├── Injector.cs         — P/Invoke DLL injection/ejection (LoadLibraryW/FreeLibrary)
-├── PipeProtocol.cs     — Bidirectional named pipe server (SendConfig, SendStop, ReadLoop)
+├── Injector.cs         — P/Invoke DLL injection (LoadLibraryW via CreateRemoteThread)
+├── PipeProtocol.cs     — Bidirectional named pipe client (SendConfig, SendBrowse, SendStop, ReadLoop)
 ├── TopologyParser.cs   — XML topology → Spectre.Console Tree widget
 ├── Viewport.cs         — Vertical scroll viewport for tree rendering
 └── RSLinxViewer.csproj — .NET 8, x86, Spectre.Console dependency
@@ -85,7 +87,7 @@ RSLinxViewer/
 
 ### PipeProtocol
 
-Synchronous byte-mode pipe (`PipeOptions.None`) with thread-pool async wrappers. Key lesson: `PipeOptions.Asynchronous` causes `Write()` / `WriteAsync()` to fail or hang when the client opened without `FILE_FLAG_OVERLAPPED`.
+`NamedPipeClientStream` with `PipeOptions.Asynchronous` (`FILE_FLAG_OVERLAPPED`). This is required because the background `ReadLoopAsync` thread and the main thread both perform I/O on the same handle concurrently. Without `PipeOptions.Asynchronous`, Windows serializes synchronous `ReadFile`/`WriteFile` calls on the same handle, causing a deadlock when pressing 'B' to send `B|` while the read loop is blocked on `ReadLine`.
 
 ### TopologyParser
 
@@ -93,7 +95,7 @@ Parses Rockwell topology XML (`<topology><tree><device>...`) into a Spectre.Cons
 
 ### Injector
 
-Direct port of `RSLinxBrowse/main.cpp` injection logic to C# P/Invoke. Handles `SeDebugPrivilege` escalation for service-mode RSLinx processes.
+Direct port of `RSLinxBrowse/main.cpp` injection logic to C# P/Invoke. Handles `SeDebugPrivilege` escalation for service-mode RSLinx processes. EjectDLL is defined but not called — the hook is intentionally left resident after viewer exit.
 
 ## Dependencies
 
