@@ -402,6 +402,9 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
     // =============================================================
     // Phase 2: Main-STA browse
     // =============================================================
+    // Capture enumerator baseline BEFORE Phase 2 so Phase 3 tracks
+    // Phase 2's enumerators (not just post-Phase-2 ones).
+    int enumBaselineBeforePhase2 = (int)g_enumerators.size();
     {
         Log(L"");
         Log(L"=== Phase 2: Main-STA browse via thread hook ===");
@@ -426,20 +429,17 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
     // =============================================================
     {
         Log(L"");
-        Log(L"=== Phase 3: Topology polling (2s interval, early exit on target) ===");
-        bool targetIdentified = false;
-        int enumBaseline = (int)g_enumerators.size();
+        std::vector<std::wstring> allIPs = config.allIPs();
+        int totalTargets = (int)allIPs.size();
+        Log(L"=== Phase 3: Topology polling (2s interval, waiting for %d target IPs, max 120s) ===", totalTargets);
+        int targetsFound = 0;
+        int lastTargetsFound = 0;
+        DWORD lastProgressTick = GetTickCount();
 
         DWORD startTick = GetTickCount();
-        while (!g_shouldStop && GetTickCount() - startTick < 30000)
+        while (!g_shouldStop && GetTickCount() - startTick < 120000)
         {
             DWORD elapsed = GetTickCount() - startTick;
-
-            if (elapsed >= 3000 && EnumeratorsCycledSince(enumBaseline))
-            {
-                Log(L"  >> All Phase 2 enumerators cycled at %dms  - advancing", elapsed);
-                break;
-            }
 
             if (elapsed > 0 && elapsed % 2000 < 100)
             {
@@ -456,18 +456,35 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
                     TopologyCounts c = CountDevicesInXML(pollFile.c_str());
                     PipeSendTopology(pollFile.c_str());
                     PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
-                    int cycled, total;
-                    GetEnumeratorStatusSince(enumBaseline, cycled, total);
-                    Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
-                        elapsed / 1000, c.totalDevices, c.identifiedDevices,
-                        (int)g_discoveredDevices.size(), cycled, total);
 
-                    std::vector<std::wstring> allIPs = config.allIPs();
-                    if (elapsed >= 3000 && !targetIdentified && !allIPs.empty() &&
-                        IsTargetIdentifiedInXML(pollFile.c_str(), allIPs))
+                    targetsFound = !allIPs.empty() ?
+                        CountTargetsIdentifiedInXML(pollFile.c_str(), allIPs) : 0;
+                    Log(L"  [%ds] %d devices, %d identified, %d/%d targets, %d events",
+                        elapsed / 1000, c.totalDevices, c.identifiedDevices,
+                        targetsFound, totalTargets,
+                        (int)g_discoveredDevices.size());
+
+                    // Track progress — reset timer when new targets appear
+                    if (targetsFound > lastTargetsFound)
                     {
-                        targetIdentified = true;
-                        Log(L"  >> Target IPs identified at %ds  - exiting Phase 3 early", elapsed / 1000);
+                        lastTargetsFound = targetsFound;
+                        lastProgressTick = GetTickCount();
+                    }
+
+                    // Exit when all target IPs are identified
+                    if (totalTargets > 0 && targetsFound >= totalTargets)
+                    {
+                        Log(L"  >> All %d target IPs identified at %ds - advancing",
+                            totalTargets, elapsed / 1000);
+                        break;
+                    }
+
+                    // Exit if no new targets found for 15s (topology stabilized)
+                    if (elapsed >= 10000 && targetsFound > 0 &&
+                        GetTickCount() - lastProgressTick >= 15000)
+                    {
+                        Log(L"  >> Topology stable for 15s at %ds (%d/%d targets) - advancing",
+                            elapsed / 1000, targetsFound, totalTargets);
                         break;
                     }
                 }
@@ -480,8 +497,9 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
             Sleep(100);
         }
 
-        if (!targetIdentified)
-            Log(L"  Target not identified after 30s  - proceeding anyway");
+        if (targetsFound < totalTargets)
+            Log(L"  Phase 3: %d/%d targets identified - proceeding",
+                targetsFound, totalTargets);
     }
 
     // Mark Phase 2+3 complete for all drivers
@@ -572,18 +590,14 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
             if (SUCCEEDED(hrBP))
             {
                 Log(L"");
-                Log(L"=== Phase 5b: Backplane module polling (event-driven, max 30s) ===");
+                Log(L"=== Phase 5b: Backplane module polling (stabilization, 2s interval, max 60s) ===");
 
+                int lastDeviceCount = 0;
+                DWORD lastProgressTick = GetTickCount();
                 DWORD bpStart = GetTickCount();
-                while (!g_shouldStop && GetTickCount() - bpStart < 30000)
+                while (!g_shouldStop && GetTickCount() - bpStart < 60000)
                 {
                     DWORD elapsed = GetTickCount() - bpStart;
-
-                    if (elapsed >= 2000 && EnumeratorsCycledSince(phase4bBaseline))
-                    {
-                        Log(L"  >> All backplane enumerators cycled at %dms  - advancing", elapsed);
-                        break;
-                    }
 
                     if (elapsed > 0 && elapsed % 2000 < 100)
                     {
@@ -605,6 +619,22 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals* pGlobals,
                             Log(L"  [%ds] %d devices, %d identified, %d events, %d/%d enumerators cycled",
                                 elapsed / 1000, c.totalDevices, c.identifiedDevices,
                                 (int)g_discoveredDevices.size(), cycled, total);
+
+                            // Track progress: did device count increase?
+                            if (c.totalDevices > lastDeviceCount)
+                            {
+                                lastDeviceCount = c.totalDevices;
+                                lastProgressTick = GetTickCount();
+                            }
+
+                            // Stabilization exit: no new devices for 10s, minimum 8s elapsed
+                            if (elapsed >= 8000 && lastDeviceCount > 0 &&
+                                GetTickCount() - lastProgressTick >= 10000)
+                            {
+                                Log(L"  >> Backplane topology stable for 10s at %ds (%d devices, %d identified) - advancing",
+                                    elapsed / 1000, c.totalDevices, c.identifiedDevices);
+                                break;
+                            }
                         }
                     }
 
@@ -1106,18 +1136,18 @@ BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD dwReason, LPVOID lpReserved)
         DisableThreadLibraryCalls(hDLL);
         g_hWorkerThread = CreateThread(NULL, 0, WorkerThread, (LPVOID)hDLL, 0, NULL);
     }
-    else if (dwReason == DLL_PROCESS_DETACH && lpReserved == NULL)
+    else if (dwReason == DLL_PROCESS_DETACH)
     {
-        // FreeLibrary-initiated unload: signal stop and close pipe handle to
-        // unblock any blocking ConnectNamedPipe / ReadFile in the worker thread.
+        // Signal worker thread to stop and unblock any overlapped pipe I/O.
+        // Handles both FreeLibrary (lpReserved==NULL) and process exit.
         g_shouldStop = true;
-        if (g_hPipe != INVALID_HANDLE_VALUE)
+        if (g_hStopEvent != NULL)
+            SetEvent(g_hStopEvent);
+
+        if (lpReserved == NULL && g_hWorkerThread != NULL)
         {
-            CloseHandle(g_hPipe);
-            g_hPipe = INVALID_HANDLE_VALUE;
-        }
-        if (g_hWorkerThread != NULL)
-        {
+            // FreeLibrary: safe to wait for worker thread to finish
+            WaitForSingleObject(g_hWorkerThread, 5000);
             CloseHandle(g_hWorkerThread);
             g_hWorkerThread = NULL;
         }

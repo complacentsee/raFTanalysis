@@ -1,40 +1,26 @@
+param(
+    [switch]$Debug
+)
+
 # RSLinxHook Stress Test - 50 cycle kill/clear/browse/query
 #
-# CONFIGURATION: edit the variables below for your testbench before running.
+# Requires RSLinx to be running with the driver already browsed (manually or
+# from a prior run). Uses --monitor --debug-xml to snapshot the existing
+# topology as a baseline, then validates subsequent stress cycles against it.
 #
-# $TARGET_IP    - IP of the primary Ethernet device to browse to
-# $DRIVER_NAME  - RSLinx driver name (case-insensitive match)
-# $QUERIES      - Ordered hashtable of query path -> expected result substring.
-#                 Keys use $TARGET_IP so only the block below needs updating.
-#
-# Expected result format: "FOUND|<classname>" or "NOTFOUND"
-# Backplane paths: "$TARGET_IP\Backplane\<slot>"
+# All browse cycles use --debug-xml so topology XML files are preserved
+# in $LOGDIR for debugging.
 
 # ---- TESTBENCH CONFIGURATION ----
-$TARGET_IPS  = @("192.0.2.1", "192.0.2.2")   # replace with your device IPs
-$DRIVER_NAME = "MyDriver"                    # replace with your RSLinx driver name
-
-$QUERIES = [ordered]@{
-    "192.0.2.1"               = "FOUND|<ip1-classname>"
-    "192.0.2.1\Backplane\0"   = "FOUND|<ip1-slot0-classname>"
-    "192.0.2.1\Backplane\1"   = "FOUND|<ip1-slot1-classname>"
-    "192.0.2.1\Backplane\2"   = "FOUND|<ip1-slot2-classname>"
-    "192.0.2.1\Backplane\3"   = "FOUND|<ip1-slot3-classname>"
-    "192.0.2.1\Backplane\99"  = "NOTFOUND"
-    "192.0.2.2"               = "FOUND|<ip2-classname>"
-    "192.0.2.2\Backplane\0"   = "FOUND|<ip2-slot0-classname>"
-    "192.0.2.2\Backplane\1"   = "FOUND|<ip2-slot1-classname>"
-    "192.0.2.2\Backplane\2"   = "FOUND|<ip2-slot2-classname>"
-    "192.0.2.2\Backplane\3"   = "FOUND|<ip2-slot3-classname>"
-    "192.0.2.2\Backplane\99"  = "NOTFOUND"
-}
+$DRIVER_NAME = "ATL"
 # ---- END CONFIGURATION ----
+
+. (Join-Path $PSScriptRoot "stress_common.ps1")
 
 $CYCLES      = 50
 $BROWSE_EXE  = Join-Path $PSScriptRoot "RSLinxBrowse\Release\RSLinxBrowse.exe"
 $HARMONY_HRC = "C:\Program Files (x86)\Rockwell Software\RSCommon\Harmony.hrc"
 $HARMONY_RSH = "C:\Program Files (x86)\Rockwell Software\RSCommon\Harmony.rsh"
-$NODE_TABLE  = "HKLM:\SOFTWARE\WOW6432Node\Rockwell Software\RSLinx\Drivers\AB_ETH\AB_ETH-1\Node Table"
 $LOGDIR      = "C:\temp"
 $LOGFILE     = "C:\temp\stress_results.txt"
 $SVC_NAME    = "RSLinx"   # RSLinx Classic service name
@@ -86,16 +72,53 @@ function ShowProgress($cycle, $cycles, $pass, $fail) {
     Add-Content $LOGFILE $line
 }
 
-# Snapshot keys/values into plain arrays once so the loop never touches $QUERIES
-# NOTE: do NOT use $expected or $EXPECTED as a loop variable — PS names are
-# case-insensitive and would overwrite this hashtable.
-$qPaths   = @($QUERIES.Keys)
-$qExpects = @($QUERIES.Values)
-
 # Clear log
 if (Test-Path $LOGFILE) { Remove-Item $LOGFILE -Force }
-Log "=== RSLinxHook Stress Test: $CYCLES cycles, $($qPaths.Count) checks each ==="
-Log "Target: $($TARGET_IPS -join ', ')  Driver: $DRIVER_NAME  Service: $SVC_NAME"
+
+# --- Resolve Node Table path and IPs dynamically ---
+$NODE_TABLE = Find-NodeTablePath $DRIVER_NAME
+if (-not $NODE_TABLE) {
+    Log "FATAL: Driver '$DRIVER_NAME' not found in registry."
+    exit 1
+}
+
+$TARGET_IPS = Read-NodeTableIPs $NODE_TABLE
+if ($TARGET_IPS.Count -eq 0) {
+    Log "FATAL: No IPs found in Node Table for driver '$DRIVER_NAME'."
+    exit 1
+}
+
+# --- Baseline snapshot: read existing topology (RSLinx must be running + browsed) ---
+$QUERIES = Do-BaselineSnapshot `
+    -BrowseExe  $BROWSE_EXE `
+    -DriverName $DRIVER_NAME `
+    -TargetIPs  $TARGET_IPS `
+    -LogDir     $LOGDIR
+
+if (-not $QUERIES -or $QUERIES.Count -eq 0) {
+    Log "FATAL: Baseline snapshot failed -- cannot establish expectations"
+    exit 1
+}
+
+# Build query set: all GM entries for reachable IPs (IP-level + backplane slots)
+$ipSet = @{}
+foreach ($tip in $TARGET_IPS) { $ipSet[$tip] = $true }
+
+$qPaths   = @()
+$qExpects = @()
+foreach ($k in $QUERIES.Keys) {
+    $v = $QUERIES[$k]
+    # Extract the IP (first segment before backslash)
+    $qIp = if ($k -match '\\') { $k.Split('\')[0] } else { $k }
+    if (-not $ipSet.ContainsKey($qIp)) { continue }
+    $qPaths   += $k
+    $qExpects += $v
+}
+
+$qCount = $qPaths.Count
+$gmCount = $QUERIES.Count
+Log "=== RSLinxHook Stress Test: $CYCLES cycles, $qCount queries each (from $gmCount GM entries) ==="
+Log "Target: $($TARGET_IPS.Count) IPs  Driver: $DRIVER_NAME  Service: $SVC_NAME"
 Log ""
 
 for ($cycle = 1; $cycle -le $CYCLES; $cycle++) {
@@ -103,16 +126,25 @@ for ($cycle = 1; $cycle -le $CYCLES; $cycle++) {
     Log "CYCLE $cycle / $CYCLES   (running total: $totalPass pass, $totalFail fail)"
     Log "------------------------------------------------------------"
 
-    # --- Step 1: Stop RSLinx service (synchronous) ---
+    # --- Step 1: Stop RSLinx service ---
     Log "  [1] Stopping RSLinx service..."
-    Stop-Service -Name $SVC_NAME -Force -ErrorAction SilentlyContinue
+    # Kill RSOBSERV first to release the injected hook DLL, then stop the service
+    Stop-Process -Name "RSOBSERV" -Force -ErrorAction SilentlyContinue
+    Stop-Service -Name $SVC_NAME -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    # Wait up to 15s for the service to stop
+    $stopDeadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $stopDeadline) {
+        $svc = Get-Service -Name $SVC_NAME
+        if ($svc.Status -eq "Stopped") { break }
+        Start-Sleep -Seconds 1
+    }
     $svc = Get-Service -Name $SVC_NAME
     if ($svc.Status -ne "Stopped") {
-        Log "      WARN: service still $($svc.Status) after Stop-Service, waiting 5s..."
-        Start-Sleep -Seconds 5
+        Log "      WARN: service still $($svc.Status), force-killing processes..."
+        Stop-Process -Name "RSLinx" -Force -ErrorAction SilentlyContinue
+        Stop-Process -Name "RSOBSERV" -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
     }
-    # Also kill RSOBSERV if hanging around
-    Stop-Process -Name "RSOBSERV" -Force -ErrorAction SilentlyContinue
     Log "      Service stopped."
 
     # --- Step 2: Delete harmony files and clear node table ---
@@ -136,11 +168,15 @@ for ($cycle = 1; $cycle -le $CYCLES; $cycle++) {
     $rslinxProc = Get-Process -Name "RSLinx" -ErrorAction SilentlyContinue
     Log "      Service running, PID: $($rslinxProc.Id)"
 
-    # --- Step 4: Inject + browse ---
+    # --- Step 4: Inject + browse (--debug-xml preserves XML for debugging) ---
     Log "  [4] Running browse (fresh injection)..."
     $t0        = Get-Date
     $ipArgs    = $TARGET_IPS | ForEach-Object { "--ip"; $_ }
-    $browseOut = & $BROWSE_EXE --driver $DRIVER_NAME @ipArgs --logdir $LOGDIR 2>&1
+    if ($Debug) {
+        $browseCmd = ('"' + $BROWSE_EXE + '" --debug-xml --driver ' + $DRIVER_NAME + ' ' + ($ipArgs -join ' ') + ' --logdir ' + $LOGDIR)
+        Log "      CMD: $browseCmd"
+    }
+    $browseOut = & $BROWSE_EXE --debug-xml --driver $DRIVER_NAME @ipArgs --logdir $LOGDIR 2>&1
     $browseS   = [int]((Get-Date) - $t0).TotalSeconds
     $browseOk  = $browseOut | Where-Object { $_ -match 'Browse complete' }
     $devLine   = ($browseOut | Where-Object { $_ -match 'DEVICES_IDENTIFIED' } | Select-Object -First 1) -replace '^\s+',''
@@ -162,39 +198,48 @@ for ($cycle = 1; $cycle -le $CYCLES; $cycle++) {
         continue
     }
 
-    # --- Step 5: Run queries ---
+    # --- Step 5: Query hook for each GM entry (FOUND/NOTFOUND status check) ---
     Log "  [5] Querying ($($qPaths.Count) checks)..."
-    $cycleOk = $true
+    $cycleOk   = $true
+    $cyclePass = 0
+    $cycleFail = 0
 
     for ($qi = 0; $qi -lt $qPaths.Count; $qi++) {
         $qPath   = $qPaths[$qi]
         $qExpect = $qExpects[$qi]
+        $wantFound = $qExpect -match '^FOUND'
 
         $qOutFile = "C:\temp\query_diag.txt"
-        $proc = Start-Process -FilePath $BROWSE_EXE `
+        if ($Debug) {
+            $qCmd = ('"' + $BROWSE_EXE + '" --query "' + $qPath + '" --logdir ' + $LOGDIR)
+            Log "      CMD: $qCmd"
+        }
+        Start-Process -FilePath $BROWSE_EXE `
             -ArgumentList "--query", $qPath, "--logdir", $LOGDIR `
             -RedirectStandardOutput $qOutFile `
             -RedirectStandardError  "C:\temp\query_diag_err.txt" `
-            -NoNewWindow -Wait -PassThru
+            -NoNewWindow -Wait
         $qOutRaw = if (Test-Path $qOutFile) { Get-Content $qOutFile -Raw } else { "" }
-        $qErrRaw = if (Test-Path "C:\temp\query_diag_err.txt") { Get-Content "C:\temp\query_diag_err.txt" -Raw } else { "" }
         $result  = (($qOutRaw -split "`n") | Where-Object { $_ -match '^\[FOUND\]|^\[NOTFOUND\]' } | Select-Object -First 1) -replace '\r',''
 
-        if ($result -and ($result -match [regex]::Escape($qExpect))) {
-            Log "      PASS  $qPath  =>  $result"
+        $gotFound = $result -match '^\[FOUND\]'
+
+        if ($wantFound -eq $gotFound) {
+            Log "      PASS  $qPath"
+            $cyclePass++
             $totalPass++
         } else {
             $got = if ($result) { $result } else { "(no output)" }
-            Log "      FAIL  $qPath  want: $qExpect  got: $got  exit=$($proc.ExitCode)"
-            Log "        STDOUT: $($qOutRaw -replace '\r?\n',' | ')"
-            Log "        STDERR: $($qErrRaw -replace '\r?\n',' | ')"
+            $want = if ($wantFound) { "FOUND" } else { "NOTFOUND" }
+            Log "      FAIL  $qPath  want=$want  got=$got"
+            $cycleFail++
             $totalFail++
             $cycleOk = $false
         }
     }
 
     $status = if ($cycleOk) { "PASSED" } else { "FAILED" }
-    Log "  => Cycle $cycle $status"
+    Log "  => Cycle $cycle $status  (pass=$cyclePass fail=$cycleFail)"
     ShowProgress $cycle $CYCLES $totalPass $totalFail
     Log ""
 }

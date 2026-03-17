@@ -1,45 +1,25 @@
 # RSLinxHook Rebrowse Stress Test - 20 cycles, no RSLinx restart
 #
-# CONFIGURATION: edit the variables below for your testbench before running.
-#
-# $TARGET_IP    - IP of the primary Ethernet device to browse to
-# $DRIVER_NAME  - RSLinx driver name (case-insensitive match)
-# $QUERIES      - Ordered hashtable of query path -> expected result substring.
-#                 Keys use $TARGET_IP so only the block below needs updating.
-#
-# Expected result format: "FOUND|<classname>" or "NOTFOUND"
-# Backplane paths: "$TARGET_IP\Backplane\<slot>"
+# Requires RSLinx to be running with the driver already browsed. Uses
+# --monitor --debug-xml to snapshot existing topology as a baseline, then
+# validates hook reuse across N rebrowse cycles.
 #
 # PURPOSE: Validates DoCleanupOnMainSTA unadvise/re-register across N hook
 # reuses against the same running RSLinx process (no service restart).
 # Stale CP accumulation from the pre-fix bug would show up as duplicate events
 # in hook_log.txt or browse failures.
+#
+# All browse cycles use --debug-xml so topology XML files are preserved
+# in $LOGDIR for debugging.
 
 # ---- TESTBENCH CONFIGURATION ----
-$TARGET_IPS  = @("192.0.2.1", "192.0.2.2")   # replace with your device IPs
-$DRIVER_NAME = "MyDriver"                    # replace with your RSLinx driver name
-
-$QUERIES = [ordered]@{
-    "192.0.2.1"               = "FOUND|<ip1-classname>"
-    "192.0.2.1\Backplane\0"   = "FOUND|<ip1-slot0-classname>"
-    "192.0.2.1\Backplane\1"   = "FOUND|<ip1-slot1-classname>"
-    "192.0.2.1\Backplane\2"   = "FOUND|<ip1-slot2-classname>"
-    "192.0.2.1\Backplane\3"   = "FOUND|<ip1-slot3-classname>"
-    "192.0.2.1\Backplane\99"  = "NOTFOUND"
-    "192.0.2.2"               = "FOUND|<ip2-classname>"
-    "192.0.2.2\Backplane\0"   = "FOUND|<ip2-slot0-classname>"
-    "192.0.2.2\Backplane\1"   = "FOUND|<ip2-slot1-classname>"
-    "192.0.2.2\Backplane\2"   = "FOUND|<ip2-slot2-classname>"
-    "192.0.2.2\Backplane\3"   = "FOUND|<ip2-slot3-classname>"
-    "192.0.2.2\Backplane\99"  = "NOTFOUND"
-}
+$DRIVER_NAME = "ATL"
 # ---- END CONFIGURATION ----
+
+. (Join-Path $PSScriptRoot "stress_common.ps1")
 
 $CYCLES      = 20
 $BROWSE_EXE  = Join-Path $PSScriptRoot "RSLinxBrowse\Release\RSLinxBrowse.exe"
-$HARMONY_HRC = "C:\Program Files (x86)\Rockwell Software\RSCommon\Harmony.hrc"
-$HARMONY_RSH = "C:\Program Files (x86)\Rockwell Software\RSCommon\Harmony.rsh"
-$NODE_TABLE  = "HKLM:\SOFTWARE\WOW6432Node\Rockwell Software\RSLinx\Drivers\AB_ETH\AB_ETH-1\Node Table"
 $LOGDIR      = "C:\temp"
 $LOGFILE     = "C:\temp\stress_rebrowse_results.txt"
 $SVC_NAME    = "RSLinx"   # RSLinx Classic service name
@@ -52,30 +32,6 @@ function Log($msg) {
     $line = "[$ts] $msg"
     Write-Host $line
     Add-Content $LOGFILE $line
-}
-
-function DeleteIfExists($path) {
-    if (Test-Path $path) {
-        Remove-Item $path -Force -ErrorAction SilentlyContinue
-        if (Test-Path $path) { Log "      WARN: could not delete $path" }
-        else                  { Log "      Deleted: $path" }
-    } else {
-        Log "      (not present): $path"
-    }
-}
-
-function ClearNodeTable($regPath) {
-    if (Test-Path $regPath) {
-        $vals = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
-        $vals.PSObject.Properties |
-            Where-Object { $_.Name -notmatch '^PS' } |
-            ForEach-Object {
-                Remove-ItemProperty -Path $regPath -Name $_.Name -Force -ErrorAction SilentlyContinue
-            }
-        Log "      Node Table cleared: $regPath"
-    } else {
-        Log "      (Node Table not present): $regPath"
-    }
 }
 
 function ShowProgress($cycle, $cycles, $pass, $fail) {
@@ -91,64 +47,42 @@ function ShowProgress($cycle, $cycles, $pass, $fail) {
     Add-Content $LOGFILE $line
 }
 
+# Clear log
+if (Test-Path $LOGFILE) { Remove-Item $LOGFILE -Force }
+
+# --- Resolve Node Table path and IPs dynamically ---
+$NODE_TABLE = Find-NodeTablePath $DRIVER_NAME
+if (-not $NODE_TABLE) {
+    Log "FATAL: Driver '$DRIVER_NAME' not found in registry."
+    exit 1
+}
+
+$TARGET_IPS = Read-NodeTableIPs $NODE_TABLE
+if ($TARGET_IPS.Count -eq 0) {
+    Log "FATAL: No IPs found in Node Table for driver '$DRIVER_NAME'."
+    exit 1
+}
+
+# --- Baseline snapshot: read existing topology (RSLinx must be running + browsed) ---
+$QUERIES = Do-BaselineSnapshot `
+    -BrowseExe  $BROWSE_EXE `
+    -DriverName $DRIVER_NAME `
+    -TargetIPs  $TARGET_IPS `
+    -LogDir     $LOGDIR
+
+if (-not $QUERIES -or $QUERIES.Count -eq 0) {
+    Log "FATAL: Baseline snapshot failed -- cannot establish expectations"
+    exit 1
+}
+
 # Snapshot keys/values into plain arrays once so the loop never touches $QUERIES
 # NOTE: do NOT use $expected or $EXPECTED as a loop variable — PS names are
 # case-insensitive and would overwrite this hashtable.
 $qPaths   = @($QUERIES.Keys)
 $qExpects = @($QUERIES.Values)
 
-# Clear log
-if (Test-Path $LOGFILE) { Remove-Item $LOGFILE -Force }
 Log "=== RSLinxHook Rebrowse Stress Test: $CYCLES cycles (no RSLinx restart), $($qPaths.Count) checks each ==="
-Log "Target: $($TARGET_IPS -join ', ')  Driver: $DRIVER_NAME  Service: $SVC_NAME"
-Log ""
-
-# ---- ONE-TIME SETUP: cold start + prime the hook ----
-Log "============================================================"
-Log "SETUP: Cold start RSLinx and prime hook with initial browse"
-Log "============================================================"
-
-Log "  [setup-1] Stopping RSLinx service..."
-Stop-Service -Name $SVC_NAME -Force -ErrorAction SilentlyContinue
-$svc = Get-Service -Name $SVC_NAME
-if ($svc.Status -ne "Stopped") {
-    Log "      WARN: service still $($svc.Status) after Stop-Service, waiting 5s..."
-    Start-Sleep -Seconds 5
-}
-Stop-Process -Name "RSOBSERV" -Force -ErrorAction SilentlyContinue
-Log "      Service stopped."
-
-Log "  [setup-2] Removing harmony files and clearing node table..."
-DeleteIfExists $HARMONY_HRC
-DeleteIfExists $HARMONY_RSH
-ClearNodeTable $NODE_TABLE
-
-Log "  [setup-3] Starting RSLinx service..."
-Start-Service -Name $SVC_NAME -ErrorAction SilentlyContinue
-$svc = Get-Service -Name $SVC_NAME
-if ($svc.Status -ne "Running") {
-    Log "FATAL: Service failed to start ($($svc.Status)) -- cannot run test"
-    exit 1
-}
-Start-Sleep -Seconds 8
-$rslinxProc = Get-Process -Name "RSLinx" -ErrorAction SilentlyContinue
-Log "      Service running, PID: $($rslinxProc.Id)"
-
-Log "  [setup-4] Running initial browse to prime the hook..."
-$t0        = Get-Date
-$ipArgs    = $TARGET_IPS | ForEach-Object { "--ip"; $_ }
-$browseOut = & $BROWSE_EXE --driver $DRIVER_NAME @ipArgs --logdir $LOGDIR 2>&1
-$browseS   = [int]((Get-Date) - $t0).TotalSeconds
-$browseOk  = $browseOut | Where-Object { $_ -match 'Browse complete' }
-$devLine   = ($browseOut | Where-Object { $_ -match 'DEVICES_IDENTIFIED' } | Select-Object -First 1) -replace '^\s+',''
-
-if ($browseOk -and $LASTEXITCODE -eq 0) {
-    Log "      Initial browse OK in ${browseS}s -- $devLine"
-} else {
-    $tail = ($browseOut | Select-Object -Last 4) -join " | "
-    Log "FATAL: Initial browse FAILED after ${browseS}s (exit=$LASTEXITCODE): $tail"
-    exit 1
-}
+Log "Target: $($TARGET_IPS.Count) IPs  Driver: $DRIVER_NAME  Service: $SVC_NAME"
 Log ""
 
 # ---- MAIN LOOP: rebrowse against the same running RSLinx process ----
@@ -169,11 +103,11 @@ for ($cycle = 1; $cycle -le $CYCLES; $cycle++) {
     $rslinxProc = Get-Process -Name "RSLinx" -ErrorAction SilentlyContinue
     Log "      RSLinx running, PID: $($rslinxProc.Id)"
 
-    # --- Step 2: Rebrowse (hook already loaded, no service restart) ---
+    # --- Step 2: Rebrowse with --debug-xml (hook already loaded, no service restart) ---
     Log "  [2] Running browse (hook reuse -- no RSLinx restart)..."
     $t0        = Get-Date
     $ipArgs    = $TARGET_IPS | ForEach-Object { "--ip"; $_ }
-$browseOut = & $BROWSE_EXE --driver $DRIVER_NAME @ipArgs --logdir $LOGDIR 2>&1
+    $browseOut = & $BROWSE_EXE --debug-xml --driver $DRIVER_NAME @ipArgs --logdir $LOGDIR 2>&1
     $browseS   = [int]((Get-Date) - $t0).TotalSeconds
     $browseOk  = $browseOut | Where-Object { $_ -match 'Browse complete' }
     $devLine   = ($browseOut | Where-Object { $_ -match 'DEVICES_IDENTIFIED' } | Select-Object -First 1) -replace '^\s+',''

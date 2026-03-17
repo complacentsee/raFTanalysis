@@ -9,6 +9,7 @@
 extern FILE* g_logFile;
 extern CRITICAL_SECTION g_logCS;
 extern HANDLE g_hPipe;
+extern HANDLE g_hStopEvent;   // signaled to unblock overlapped pipe operations
 extern bool g_pipeConnected;
 
 void PipeSend(const char* data, int len);

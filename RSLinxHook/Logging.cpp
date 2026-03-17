@@ -7,6 +7,7 @@
 FILE* g_logFile = nullptr;
 CRITICAL_SECTION g_logCS;
 HANDLE g_hPipe = INVALID_HANDLE_VALUE;
+HANDLE g_hStopEvent = NULL;
 bool g_pipeConnected = false;
 
 // ============================================================
@@ -16,12 +17,19 @@ bool g_pipeConnected = false;
 void PipeSend(const char* data, int len)
 {
     if (!g_pipeConnected) return;
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) { g_pipeConnected = false; return; }
     DWORD written;
-    if (!WriteFile(g_hPipe, data, len, &written, NULL))
+    BOOL ok = WriteFile(g_hPipe, data, len, &written, &ov);
+    if (!ok)
     {
-        // Do NOT close handle — persistent server model; just mark disconnected
-        g_pipeConnected = false;
+        if (GetLastError() == ERROR_IO_PENDING)
+            GetOverlappedResult(g_hPipe, &ov, &written, TRUE);
+        else
+            g_pipeConnected = false;
     }
+    CloseHandle(ov.hEvent);
 }
 
 void Log(const wchar_t* fmt, ...)
@@ -93,7 +101,14 @@ bool PipeCheckStop()
         char stopBuf[64];
         DWORD bytesRead = 0;
         DWORD toRead = bytesAvail < 63 ? bytesAvail : 63;
-        if (ReadFile(g_hPipe, stopBuf, toRead, &bytesRead, NULL) && bytesRead > 0) {
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) return false;
+        BOOL ok = ReadFile(g_hPipe, stopBuf, toRead, &bytesRead, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING)
+            GetOverlappedResult(g_hPipe, &ov, &bytesRead, TRUE);
+        CloseHandle(ov.hEvent);
+        if (bytesRead > 0) {
             stopBuf[bytesRead] = '\0';
             if (strstr(stopBuf, "STOP")) {
                 return true;
@@ -109,9 +124,10 @@ bool PipeCheckStop()
 
 bool PipeCreateServer()
 {
+    g_hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_hPipe = CreateNamedPipeW(
         L"\\\\.\\pipe\\RSLinxHook",
-        PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1, 4096, 4096, 0, NULL);
     return g_hPipe != INVALID_HANDLE_VALUE;
@@ -120,11 +136,52 @@ bool PipeCreateServer()
 bool PipeAcceptClient()
 {
     if (g_hPipe == INVALID_HANDLE_VALUE) return false;
-    BOOL ok = ConnectNamedPipe(g_hPipe, NULL);
-    if (!ok && GetLastError() == ERROR_PIPE_CONNECTED)
-        ok = TRUE;
-    if (ok) g_pipeConnected = true;
-    return ok != FALSE;
+
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) return false;
+
+    BOOL ok = ConnectNamedPipe(g_hPipe, &ov);
+    if (!ok)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_CONNECTED)
+        {
+            CloseHandle(ov.hEvent);
+            g_pipeConnected = true;
+            return true;
+        }
+        if (err == ERROR_IO_PENDING)
+        {
+            // Wait for either a client connection or the stop event
+            HANDLE handles[2] = { ov.hEvent, g_hStopEvent };
+            DWORD waitResult = WaitForMultipleObjects(g_hStopEvent ? 2 : 1, handles, FALSE, INFINITE);
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                // Client connected
+                DWORD dummy;
+                GetOverlappedResult(g_hPipe, &ov, &dummy, FALSE);
+                CloseHandle(ov.hEvent);
+                g_pipeConnected = true;
+                return true;
+            }
+            else
+            {
+                // Stop event signaled or error — cancel the pending I/O
+                CancelIoEx(g_hPipe, &ov);
+                CloseHandle(ov.hEvent);
+                return false;
+            }
+        }
+        // Other error
+        CloseHandle(ov.hEvent);
+        return false;
+    }
+
+    // ConnectNamedPipe returned TRUE (rare but possible)
+    CloseHandle(ov.hEvent);
+    g_pipeConnected = true;
+    return true;
 }
 
 void PipeDisconnectClient()
@@ -140,6 +197,11 @@ void PipeDestroyServer()
         CloseHandle(g_hPipe);
         g_hPipe = INVALID_HANDLE_VALUE;
     }
+    if (g_hStopEvent != NULL)
+    {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = NULL;
+    }
 }
 
 // Read one newline-terminated line. Returns false on disconnect or g_shouldStop.
@@ -149,8 +211,31 @@ bool PipeReadLine(char* buf, int maxLen)
     int i = 0;
     while (i < maxLen - 1 && !g_shouldStop)
     {
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) { buf[i] = '\0'; return false; }
+
         DWORD bytesRead = 0;
-        if (!ReadFile(g_hPipe, buf + i, 1, &bytesRead, NULL) || bytesRead == 0)
+        BOOL ok = ReadFile(g_hPipe, buf + i, 1, &bytesRead, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING)
+        {
+            HANDLE handles[2] = { ov.hEvent, g_hStopEvent };
+            DWORD wait = WaitForMultipleObjects(g_hStopEvent ? 2 : 1, handles, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0)
+            {
+                GetOverlappedResult(g_hPipe, &ov, &bytesRead, FALSE);
+            }
+            else
+            {
+                CancelIoEx(g_hPipe, &ov);
+                CloseHandle(ov.hEvent);
+                buf[i] = '\0';
+                return false;
+            }
+        }
+        CloseHandle(ov.hEvent);
+
+        if (bytesRead == 0)
         {
             g_pipeConnected = false;
             buf[i] = '\0';

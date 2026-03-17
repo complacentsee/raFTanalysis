@@ -36,6 +36,7 @@ extern std::map<std::wstring, QueryResult> g_queryCache;
 
 bool SaveTopologyXML(IRSTopologyGlobals* pGlobals, const wchar_t* filename);
 TopologyCounts CountDevicesInXML(const wchar_t* filename);
+int CountTargetsIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs);
 bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs);
 void UpdateDeviceIPsFromXML(const wchar_t* filename);
 void PopulateQueryCache(const wchar_t* xmlFile);

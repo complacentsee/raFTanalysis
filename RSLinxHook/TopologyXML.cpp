@@ -107,8 +107,13 @@ TopologyCounts CountDevicesInXML(const wchar_t* filename)
     TopologyCounts counts = { 0, 0 };
     FILE* f = _wfopen(filename, L"r");
     if (!f) return counts;
-    char buf[65536];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    size_t allocSize = (fileSize > 0) ? (size_t)fileSize + 1 : 262144;
+    char* buf = (char*)malloc(allocSize);
+    if (!buf) { fclose(f); return counts; }
+    size_t n = fread(buf, 1, allocSize - 1, f);
     buf[n] = 0;
     fclose(f);
     char* p = buf;
@@ -125,19 +130,26 @@ TopologyCounts CountDevicesInXML(const wchar_t* filename)
         }
         p++;
     }
+    free(buf);
     return counts;
 }
 
-// Check if a specific IP address has been identified (non-Unrecognized) in topology XML
-bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs)
+// Count how many target IPs have been identified (non-Unrecognized) in topology XML
+int CountTargetsIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs)
 {
     FILE* f = _wfopen(filename, L"r");
-    if (!f) return false;
-    char buf[65536];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    size_t allocSize = (fileSize > 0) ? (size_t)fileSize + 1 : 262144;
+    char* buf = (char*)malloc(allocSize);
+    if (!buf) { fclose(f); return 0; }
+    size_t n = fread(buf, 1, allocSize - 1, f);
     buf[n] = 0;
     fclose(f);
 
+    int count = 0;
     for (auto& wip : targetIPs)
     {
         // Convert wide IP to narrow
@@ -166,12 +178,22 @@ bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wst
                 if (strncmp(cn, "Unrecognized Device", 19) != 0 &&
                     strncmp(cn, "Workstation", 11) != 0 &&
                     strncmp(cn, "\"", 1) != 0)  // empty classname
-                    return true;
+                {
+                    count++;
+                    break;  // This target IP is identified, move to next
+                }
             }
             p++;
         }
     }
-    return false;
+    free(buf);
+    return count;
+}
+
+// Check if ANY target IP has been identified — backwards compat wrapper
+bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs)
+{
+    return CountTargetsIdentifiedInXML(filename, targetIPs) > 0;
 }
 
 // Query topology XML for a device at an IP/port/slot path
@@ -307,10 +329,11 @@ void PopulateQueryCache(const wchar_t* xmlFile)
         g_queryCache[ipW] = ipResult;
 
         // Walk into ports → buses → slots
-        // Find all <port name="..."> within the next 8KB of this device block
+        // Find end of this device's block: next top-level <address type="String" (next IP)
+        // or end of buffer, whichever comes first
         char* portSearch = devPos;
-        char* portEnd = devPos + 8192;
-        if (portEnd > buf + n) portEnd = buf + n;
+        char* nextIp = strstr(devPos + 1, "<address type=\"String\" value=\"");
+        char* portEnd = nextIp ? nextIp : buf + n;
 
         while (portSearch < portEnd)
         {
@@ -325,10 +348,11 @@ void PopulateQueryCache(const wchar_t* xmlFile)
             char* busPos = strstr(portPos, "<bus ");
             if (!busPos || busPos > portPos + 200) { portSearch = portPos + 1; continue; }
 
-            // Enumerate <address type="Short" value="N"> within the bus block (next 4KB)
+            // Enumerate <address type="Short" value="N"> within the bus block
+            // Use </bus> as boundary instead of fixed window
             char* slotSearch = busPos;
-            char* slotEnd = busPos + 4096;
-            if (slotEnd > buf + n) slotEnd = buf + n;
+            char* busClose = strstr(busPos, "</bus>");
+            char* slotEnd = busClose ? busClose : portEnd;
 
             while (slotSearch < slotEnd)
             {
