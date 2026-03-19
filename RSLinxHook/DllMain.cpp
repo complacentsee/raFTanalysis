@@ -401,15 +401,14 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals*& pGlobals,
     }
 
     // Helper: SaveTopologyXML with retry + message pump on failure
-    // If all retries fail, attempt to re-acquire pGlobals from HarmonyServices
+    // If all retries fail, attempt to re-acquire pGlobals once from HarmonyServices
+    bool reacquireAttempted = false;
     auto SaveTopologyWithRetry = [&](const wchar_t* path, int maxRetries = 3) -> bool {
         for (int attempt = 0; attempt < maxRetries; attempt++)
         {
             if (SaveTopologyXML(pGlobals, path)) return true;
             if (attempt < maxRetries - 1 && !g_shouldStop)
             {
-                Log(L"  >> SaveTopologyXML failed (attempt %d/%d), pumping messages for 2s...",
-                    attempt + 1, maxRetries);
                 for (int w = 0; w < 20 && !g_shouldStop; w++)
                 {
                     MSG msg;
@@ -419,9 +418,10 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals*& pGlobals,
                 }
             }
         }
-        // All retries failed — try re-acquiring pGlobals from HarmonyServices
-        if (g_pHarmony && !g_shouldStop)
+        // All retries failed — try re-acquiring pGlobals once per session
+        if (g_pHarmony && !g_shouldStop && !reacquireAttempted)
         {
+            reacquireAttempted = true;
             Log(L"  >> Re-acquiring TopologyGlobals after persistent SaveTopologyXML failure...");
             IUnknown* pUnk = nullptr;
             HRESULT hr = g_pHarmony->GetSpecialObject(&CLSID_RSTopologyGlobals, &IID_IRSTopologyGlobals, &pUnk);
@@ -499,9 +499,11 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals*& pGlobals,
                 } else {
                     pollFile = LogPath(config.logDir, L"hook_topo_poll.xml");
                 }
-                if (SaveTopologyWithRetry(pollFile.c_str()))
+                TopologyCounts c = { 0, 0 };
+                bool xmlOk = SaveTopologyWithRetry(pollFile.c_str());
+                if (xmlOk)
                 {
-                    TopologyCounts c = CountDevicesInXML(pollFile.c_str());
+                    c = CountDevicesInXML(pollFile.c_str());
                     PipeSendTopology(pollFile.c_str());
                     PipeSendStatus(c.totalDevices, c.identifiedDevices, (int)g_discoveredDevices.size());
 
@@ -511,7 +513,19 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals*& pGlobals,
                         elapsed / 1000, c.totalDevices, c.identifiedDevices,
                         targetsFound, totalTargets,
                         (int)g_discoveredDevices.size());
+                }
+                else
+                {
+                    // Fallback: count from in-memory cache when SaveTopologyXML fails
+                    c = CountDevicesFromCache();
+                    targetsFound = !allIPs.empty() ?
+                        CountTargetsFromCache(allIPs) : 0;
+                    Log(L"  [%ds] (cache) %d devices, %d identified, %d/%d targets",
+                        elapsed / 1000, c.totalDevices, c.identifiedDevices,
+                        targetsFound, totalTargets);
+                }
 
+                {
                     // Track progress — reset timer when new targets appear
                     if (targetsFound > lastTargetsFound)
                     {
@@ -567,8 +581,17 @@ static void RunBrowsePhases(HookConfig& config, IRSTopologyGlobals*& pGlobals,
     // =============================================================
     {
         std::wstring midPath = LogPath(config.logDir, config.debugXml ? L"hook_topo_mid.xml" : L"hook_topo_poll.xml");
-        SaveTopologyWithRetry(midPath.c_str());
-        TopologyCounts pre = CountDevicesInXML(midPath.c_str());
+        TopologyCounts pre = { 0, 0 };
+        if (SaveTopologyWithRetry(midPath.c_str()))
+        {
+            pre = CountDevicesInXML(midPath.c_str());
+        }
+        else
+        {
+            // Fallback: use cache counts if XML save fails
+            pre = CountDevicesFromCache();
+            Log(L"  (using cache counts - XML save failed)");
+        }
         Log(L"Topology after bus browse: %d devices, %d identified",
             pre.totalDevices, pre.identifiedDevices);
 
@@ -1045,7 +1068,13 @@ static void HandleSession(HookConfig& config, IRSTopologyGlobals*& pGlobals,
         }
         else
         {
-            Log(L"[WARN] No cached topology at %s  - client will get empty result", pollFile.c_str());
+            // XML file missing — use in-memory cache instead
+            Log(L"[WARN] No cached XML — replaying from in-memory cache");
+            TopologyCounts cached = CountDevicesFromCache();
+            WalkTopologyTree(pGlobals);
+            PipeSendStatus(cached.totalDevices, cached.identifiedDevices, (int)g_discoveredDevices.size());
+            Log(L"[INFO] Replayed from cache: %d devices, %d identified",
+                cached.totalDevices, cached.identifiedDevices);
         }
     }
 

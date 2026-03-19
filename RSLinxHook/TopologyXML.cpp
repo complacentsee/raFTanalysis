@@ -90,8 +90,24 @@ bool SaveTopologyXML(IRSTopologyGlobals* pGlobals, const wchar_t* filename)
     VARIANT result;
     VariantInit(&result);
 
+    EXCEPINFO excepInfo = {};
     hr = pDisp->Invoke(1610743808, IID_NULL, LOCALE_USER_DEFAULT,
-                        DISPATCH_METHOD, &params, &result, nullptr, nullptr);
+                        DISPATCH_METHOD, &params, &result, &excepInfo, nullptr);
+
+    if (FAILED(hr))
+    {
+        Log(L"  >> SaveTopologyXML Invoke failed: hr=0x%08x", hr);
+        if (excepInfo.bstrDescription)
+        {
+            Log(L"  >> EXCEPINFO: %s", excepInfo.bstrDescription);
+            SysFreeString(excepInfo.bstrDescription);
+        }
+        if (excepInfo.bstrSource)
+        {
+            Log(L"  >> Source: %s", excepInfo.bstrSource);
+            SysFreeString(excepInfo.bstrSource);
+        }
+    }
 
     VariantClear(&args[0]);
     VariantClear(&args[1]);
@@ -194,6 +210,48 @@ int CountTargetsIdentifiedInXML(const wchar_t* filename, const std::vector<std::
 bool IsTargetIdentifiedInXML(const wchar_t* filename, const std::vector<std::wstring>& targetIPs)
 {
     return CountTargetsIdentifiedInXML(filename, targetIPs) > 0;
+}
+
+// ============================================================
+// Cache-based counting (fallback when SaveTopologyXML fails)
+// Uses g_queryCache populated by PopulateQueryCache from the
+// last successful XML save.
+// ============================================================
+
+TopologyCounts CountDevicesFromCache()
+{
+    TopologyCounts counts = { 0, 0 };
+    for (const auto& kv : g_queryCache)
+    {
+        // Only count IP-level entries (no backslash = top-level device)
+        if (kv.first.find(L'\\') != std::wstring::npos) continue;
+
+        counts.totalDevices++;
+        if (!kv.second.classname.empty() &&
+            kv.second.classname != L"Unrecognized Device" &&
+            kv.second.classname != L"Workstation")
+        {
+            counts.identifiedDevices++;
+        }
+    }
+    return counts;
+}
+
+int CountTargetsFromCache(const std::vector<std::wstring>& targetIPs)
+{
+    int count = 0;
+    for (const auto& ip : targetIPs)
+    {
+        auto it = g_queryCache.find(ip);
+        if (it != g_queryCache.end() &&
+            !it->second.classname.empty() &&
+            it->second.classname != L"Unrecognized Device" &&
+            it->second.classname != L"Workstation")
+        {
+            count++;
+        }
+    }
+    return count;
 }
 
 // Query topology XML for a device at an IP/port/slot path

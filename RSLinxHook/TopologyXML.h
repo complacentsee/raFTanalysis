@@ -45,6 +45,10 @@ QueryResult QueryXMLForPath(const wchar_t* xmlFile,
                              const std::wstring& portName,
                              int slot);
 
+// Cache-based counting (fallback when SaveTopologyXML fails with DISP_E_EXCEPTION)
+TopologyCounts CountDevicesFromCache();
+int CountTargetsFromCache(const std::vector<std::wstring>& targetIPs);
+
 // N| topology pipe: ordered Ethernet device names per driver (populated by DoBusBrowse).
 // Used by WalkTopologyTree so no COM calls are needed from the worker thread.
 extern std::map<std::wstring, std::vector<std::wstring>> g_driverDeviceNames;
